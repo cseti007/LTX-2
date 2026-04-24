@@ -19,6 +19,10 @@ Usage:
     python scripts/inference.py --checkpoint path/to/model.safetensors \
         --text-encoder-path path/to/gemma \
         --prompt "A cat turning into a dog" --reference-video input.mp4 --output output.mp4
+    # Multi-reference IC-LoRA (repeat --reference-video, order must match training config)
+    python scripts/inference.py --checkpoint path/to/model.safetensors \
+        --text-encoder-path path/to/gemma \
+        --prompt "..." --reference-video style.mp4 --reference-video motion.mp4 --output output.mp4
     # With LoRA weights
     python scripts/inference.py --checkpoint path/to/model.safetensors \
         --text-encoder-path path/to/gemma \
@@ -240,8 +244,13 @@ def main() -> None:  # noqa: PLR0912, PLR0915
     parser.add_argument(
         "--reference-video",
         type=str,
+        action="append",
         default=None,
-        help="Path to reference video for video-to-video generation (IC-LoRA style)",
+        help=(
+            "Path to a reference video for video-to-video generation (IC-LoRA style). "
+            "Repeat the flag to pass multiple references (multi-reference IC-LoRA); "
+            "the order must match the training_strategy.reference_latents_dirs used at train time."
+        ),
     )
     parser.add_argument(
         "--include-reference-in-output",
@@ -281,7 +290,7 @@ def main() -> None:  # noqa: PLR0912, PLR0915
     args = parser.parse_args()
 
     # Validate conditioning arguments
-    if args.include_reference_in_output and args.reference_video is None:
+    if args.include_reference_in_output and not args.reference_video:
         parser.error("--include-reference-in-output requires --reference-video")
 
     # Validate arguments
@@ -292,7 +301,7 @@ def main() -> None:  # noqa: PLR0912, PLR0915
     print("=" * 80)
 
     # Determine if we need VAE encoder (for image or video conditioning)
-    need_vae_encoder = args.condition_image is not None or args.reference_video is not None
+    need_vae_encoder = args.condition_image is not None or bool(args.reference_video)
 
     components = load_model(
         checkpoint_path=args.checkpoint,
@@ -317,17 +326,20 @@ def main() -> None:  # noqa: PLR0912, PLR0915
         print(f"Loading conditioning image from {args.condition_image}...")
         condition_image = load_image(args.condition_image)
 
-    # Load reference video if provided
-    reference_video = None
+    # Load reference videos if provided (one or more, in the order given on the command line)
+    reference_videos: list | None = None
     if args.reference_video:
-        print(f"Loading reference video from {args.reference_video}...")
-        reference_video, ref_fps = read_video(args.reference_video, max_frames=args.num_frames)
-        print(f"  Loaded {reference_video.shape[0]} frames @ {ref_fps:.1f} fps")
+        reference_videos = []
+        for ref_path in args.reference_video:
+            print(f"Loading reference video from {ref_path}...")
+            ref_tensor, ref_fps = read_video(ref_path, max_frames=args.num_frames)
+            print(f"  Loaded {ref_tensor.shape[0]} frames @ {ref_fps:.1f} fps")
+            reference_videos.append(ref_tensor)
 
     # Determine generation mode
-    if args.reference_video is not None and args.condition_image is not None:
+    if reference_videos is not None and args.condition_image is not None:
         mode = "Video-to-Video + Image Conditioning (V2V+I2V)"
-    elif args.reference_video is not None:
+    elif reference_videos is not None:
         mode = "Video-to-Video (V2V)"
     elif args.condition_image is not None:
         mode = "Image-to-Video (I2V)"
@@ -355,10 +367,11 @@ def main() -> None:  # noqa: PLR0912, PLR0915
         print(f"LoRA: {args.lora_path}")
     if condition_image is not None:
         print(f"Conditioning: Image ({args.condition_image})")
-    if reference_video is not None:
-        print(f"Reference: Video ({args.reference_video})")
+    if reference_videos is not None:
+        refs_str = ", ".join(args.reference_video)
+        print(f"Reference: Video(s) [{len(reference_videos)}] ({refs_str})")
         if args.include_reference_in_output:
-            print("  → Will include reference side-by-side in output")
+            print("  → Will include reference(s) side-by-side in output")
     if generate_audio:
         video_duration = args.num_frames / args.frame_rate
         print(f"Audio: Enabled (duration will match video: {video_duration:.2f}s)")
@@ -378,7 +391,7 @@ def main() -> None:  # noqa: PLR0912, PLR0915
         guidance_scale=args.guidance_scale,
         seed=args.seed,
         condition_image=condition_image,
-        reference_video=reference_video,
+        reference_videos=reference_videos,
         generate_audio=generate_audio,
         include_reference_in_output=args.include_reference_in_output,
         stg_scale=args.stg_scale,

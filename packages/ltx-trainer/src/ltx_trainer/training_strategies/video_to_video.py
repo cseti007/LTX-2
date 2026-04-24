@@ -34,9 +34,16 @@ class VideoToVideoConfig(TrainingStrategyConfigBase):
         le=1.0,
     )
 
-    reference_latents_dir: str = Field(
-        default="reference_latents",
-        description="Directory name for latents of reference videos",
+    reference_latents_dirs: list[str] = Field(
+        default_factory=lambda: ["reference_latents"],
+        description=(
+            "Directory names for latents of reference videos. All references are "
+            "concatenated in this order before the target. Use a single-element list "
+            "for standard IC-LoRA training, or multiple elements for multi-reference "
+            "conditioning. All references must share the same spatial resolution "
+            "(height × width); frame counts may differ across references."
+        ),
+        min_length=1,
     )
 
 
@@ -63,12 +70,18 @@ class VideoToVideoStrategy(TrainingStrategy):
         self.reference_downscale_factor = None  # Will be inferred from first batch
 
     def get_data_sources(self) -> dict[str, str]:
-        """IC-LoRA training requires latents, conditions, and reference latents."""
-        return {
+        """IC-LoRA training requires latents, conditions, and reference latents.
+
+        For multi-reference training, each entry in ``reference_latents_dirs`` is
+        exposed under a distinct batch key ``ref_latents_{i}`` (0-indexed).
+        """
+        sources = {
             "latents": "latents",
             "conditions": "conditions",
-            self.config.reference_latents_dir: "ref_latents",
         }
+        for i, ref_dir in enumerate(self.config.reference_latents_dirs):
+            sources[ref_dir] = f"ref_latents_{i}"
+        return sources
 
     def prepare_training_inputs(  # noqa: PLR0915
         self,
@@ -79,17 +92,33 @@ class VideoToVideoStrategy(TrainingStrategy):
         # Get pre-encoded latents - dataset provides uniform non-patchified format [B, C, F, H, W]
         latents = batch["latents"]
         target_latents = latents["latents"]
-        ref_latents = batch["ref_latents"]["latents"]
 
-        # Get dimensions
+        # Load N reference latents (ref_latents_0, ref_latents_1, ...) produced by get_data_sources()
+        num_refs = len(self.config.reference_latents_dirs)
+        ref_infos = [batch[f"ref_latents_{i}"] for i in range(num_refs)]
+        ref_latents_list = [info["latents"] for info in ref_infos]
+
+        # Get target dimensions
         num_frames = latents["num_frames"][0].item()
         height = latents["height"][0].item()
         width = latents["width"][0].item()
 
-        ref_latents_info = batch["ref_latents"]
-        ref_frames = ref_latents_info["num_frames"][0].item()
-        ref_height = ref_latents_info["height"][0].item()
-        ref_width = ref_latents_info["width"][0].item()
+        # Per-reference (frames, height, width). Frame counts may differ across refs
+        # (e.g. a short gradient-signal ref + a longer content-pool ref), but the
+        # spatial resolution must be identical so a single downscale factor applies.
+        ref_dims_list = [
+            (info["num_frames"][0].item(), info["height"][0].item(), info["width"][0].item())
+            for info in ref_infos
+        ]
+        ref_height = ref_dims_list[0][1]
+        ref_width = ref_dims_list[0][2]
+        for i, (_f_i, h_i, w_i) in enumerate(ref_dims_list[1:], start=1):
+            if (h_i, w_i) != (ref_height, ref_width):
+                raise ValueError(
+                    f"All reference videos must share the same spatial resolution. "
+                    f"Reference 0 has (height={ref_height}, width={ref_width}), "
+                    f"but reference {i} has (height={h_i}, width={w_i})."
+                )
 
         # Infer reference downscale factor from dimension ratios
         # This allows training with downscaled reference videos for efficiency
@@ -113,7 +142,7 @@ class VideoToVideoStrategy(TrainingStrategy):
 
         # Patchify latents: [B, C, F, H, W] -> [B, seq_len, C]
         target_latents = self._video_patchifier.patchify(target_latents)
-        ref_latents = self._video_patchifier.patchify(ref_latents)
+        ref_latents_list = [self._video_patchifier.patchify(r) for r in ref_latents_list]
 
         # Handle FPS
         fps = latents.get("fps", None)
@@ -130,14 +159,17 @@ class VideoToVideoStrategy(TrainingStrategy):
         prompt_attention_mask = conditions["prompt_attention_mask"]
 
         batch_size = target_latents.shape[0]
-        ref_seq_len = ref_latents.shape[1]
+        # Each reference contributes its own sequence; total_ref_seq_len is the sum
+        # (used for loss slicing, mask sizing, and the target-region offset).
+        ref_seq_lens = [r.shape[1] for r in ref_latents_list]
+        total_ref_seq_len = sum(ref_seq_lens)
         target_seq_len = target_latents.shape[1]
         device = target_latents.device
         dtype = target_latents.dtype
 
         # Create conditioning mask
         # Reference tokens are always conditioning (timestep=0)
-        ref_conditioning_mask = torch.ones(batch_size, ref_seq_len, dtype=torch.bool, device=device)
+        ref_conditioning_mask = torch.ones(batch_size, total_ref_seq_len, dtype=torch.bool, device=device)
 
         # Target tokens: check for first frame conditioning
         target_conditioning_mask = self._create_first_frame_conditioning_mask(
@@ -167,31 +199,35 @@ class VideoToVideoStrategy(TrainingStrategy):
         # Targets for loss computation
         targets = noise - target_latents
 
-        # Concatenate reference (clean) and target (noisy)
-        combined_latents = torch.cat([ref_latents, noisy_target], dim=1)
+        # Concatenate all references (clean) in order, then target (noisy)
+        combined_latents = torch.cat([*ref_latents_list, noisy_target], dim=1)
 
         # Create per-token timesteps
         timesteps = self._create_per_token_timesteps(conditioning_mask, sigmas.squeeze())
 
-        # Generate positions for reference and target separately, then concatenate
-        ref_positions = self._get_video_positions(
-            num_frames=ref_frames,
-            height=ref_height,
-            width=ref_width,
-            batch_size=batch_size,
-            fps=fps,
-            device=device,
-            dtype=dtype,
-        )
+        # Generate positions per reference (each may have its own frame count),
+        # then concatenate along the sequence dimension together with target positions.
+        # Position tensor shape per call: [B, 3, seq_len, 2] where dim 1 is (time, height, width).
+        ref_positions_list = []
+        for f_i, h_i, w_i in ref_dims_list:
+            pos = self._get_video_positions(
+                num_frames=f_i,
+                height=h_i,
+                width=w_i,
+                batch_size=batch_size,
+                fps=fps,
+                device=device,
+                dtype=dtype,
+            )
+            # Scale reference positions to match target coordinate space (spatial only);
+            # time axis (index 0) is left untouched.
+            if reference_downscale_factor != 1:
+                pos = pos.clone()
+                pos[:, 1, ...] *= reference_downscale_factor  # height axis
+                pos[:, 2, ...] *= reference_downscale_factor  # width axis
+            ref_positions_list.append(pos)
 
-        # Scale reference positions to match target coordinate space
-        # This maps ref positions from (0, ref_H, ref_W) to (0, target_H, target_W)
-        # Position tensor shape: [B, 3, seq_len, 2] where dim 1 is (time, height, width)
-        if reference_downscale_factor != 1:
-            ref_positions = ref_positions.clone()
-            ref_positions[:, 1, ...] *= reference_downscale_factor  # height axis
-            ref_positions[:, 2, ...] *= reference_downscale_factor  # width axis
-            # Time axis (index 0) remains unchanged
+        all_ref_positions = torch.cat(ref_positions_list, dim=2) if num_refs > 1 else ref_positions_list[0]
 
         target_positions = self._get_video_positions(
             num_frames=num_frames,
@@ -204,7 +240,7 @@ class VideoToVideoStrategy(TrainingStrategy):
         )
 
         # Concatenate positions along sequence dimension
-        positions = torch.cat([ref_positions, target_positions], dim=2)
+        positions = torch.cat([all_ref_positions, target_positions], dim=2)
 
         # Create video Modality
         video_modality = Modality(
@@ -218,9 +254,9 @@ class VideoToVideoStrategy(TrainingStrategy):
         )
 
         # Loss mask: only compute loss on non-conditioning target tokens
-        # Reference tokens: all False (no loss)
+        # Reference tokens: all False (no loss) across every reference
         # Target tokens: True where not conditioning
-        ref_loss_mask = torch.zeros(batch_size, ref_seq_len, dtype=torch.bool, device=device)
+        ref_loss_mask = torch.zeros(batch_size, total_ref_seq_len, dtype=torch.bool, device=device)
         target_loss_mask = ~target_conditioning_mask
         video_loss_mask = torch.cat([ref_loss_mask, target_loss_mask], dim=1)
 
@@ -231,7 +267,7 @@ class VideoToVideoStrategy(TrainingStrategy):
             audio_targets=None,
             video_loss_mask=video_loss_mask,
             audio_loss_mask=None,
-            ref_seq_len=ref_seq_len,
+            ref_seq_len=total_ref_seq_len,
         )
 
     def compute_loss(

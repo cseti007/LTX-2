@@ -215,10 +215,14 @@ class ValidationConfig(ConfigBaseModel):
         "One image path must be provided for each validation prompt",
     )
 
-    reference_videos: list[str] | None = Field(
+    reference_videos: list[list[str]] | None = Field(
         default=None,
-        description="List of reference video paths to use for validation. "
-        "One video path must be provided for each validation prompt",
+        description=(
+            "Per-prompt lists of reference video paths for IC-LoRA validation. "
+            "Must contain one inner list per validation prompt. Each inner list may hold one or more "
+            "reference paths (for multi-reference IC-LoRA); all inner lists must have the same length, "
+            "matching the number of entries in training_strategy.reference_latents_dirs."
+        ),
     )
 
     reference_downscale_factor: int = Field(
@@ -335,18 +339,32 @@ class ValidationConfig(ConfigBaseModel):
 
     @field_validator("reference_videos")
     @classmethod
-    def validate_reference_videos(cls, v: list[str] | None, info: ValidationInfo) -> list[str] | None:
-        """Validate that number of reference videos (if provided) matches number of prompts."""
+    def validate_reference_videos(
+        cls, v: list[list[str]] | None, info: ValidationInfo
+    ) -> list[list[str]] | None:
+        """Validate that reference-video lists align with prompts and have a consistent count."""
         if v is None:
             return None
 
         num_prompts = len(info.data.get("prompts", []))
-        if v is not None and len(v) != num_prompts:
-            raise ValueError(f"Number of reference videos ({len(v)}) must match number of prompts ({num_prompts})")
+        if len(v) != num_prompts:
+            raise ValueError(
+                f"Number of reference_videos lists ({len(v)}) must match number of prompts ({num_prompts})"
+            )
 
-        for video_path in v:
-            if not Path(video_path).exists():
-                raise ValueError(f"Reference video path '{video_path}' does not exist")
+        if not v or not v[0]:
+            raise ValueError("reference_videos must contain at least one reference path per prompt")
+
+        expected_refs_per_prompt = len(v[0])
+        for i, inner in enumerate(v):
+            if len(inner) != expected_refs_per_prompt:
+                raise ValueError(
+                    f"All reference_videos entries must have the same length. "
+                    f"Prompt 0 has {expected_refs_per_prompt} refs, but prompt {i} has {len(inner)}."
+                )
+            for video_path in inner:
+                if not Path(video_path).exists():
+                    raise ValueError(f"Reference video path '{video_path}' does not exist")
 
         return v
 

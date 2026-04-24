@@ -46,7 +46,7 @@ def preprocess_dataset(  # noqa: PLR0913
     text_encoder_path: str,
     device: str,
     remove_llm_prefixes: bool = False,
-    reference_column: str | None = None,
+    reference_columns: list[str] | None = None,
     reference_downscale_factor: int = 1,
     with_audio: bool = False,
     load_text_encoder_in_8bit: bool = False,
@@ -99,8 +99,8 @@ def preprocess_dataset(  # noqa: PLR0913
             audio_output_dir=str(audio_latents_dir) if audio_latents_dir else None,
         )
 
-        # Process reference videos if reference_column is provided
-        if reference_column:
+        # Process reference videos if reference_columns is provided
+        if reference_columns:
             # Validate: scaled references with multiple buckets can cause ambiguous bucket matching
             if reference_downscale_factor > 1 and len(resolution_buckets) > 1:
                 raise ValueError(
@@ -115,25 +115,34 @@ def preprocess_dataset(  # noqa: PLR0913
 
             if reference_downscale_factor > 1:
                 logger.info(
-                    f"Processing reference videos for IC-LoRA training at 1/{reference_downscale_factor} resolution..."
+                    f"Processing {len(reference_columns)} reference stream(s) for IC-LoRA training "
+                    f"at 1/{reference_downscale_factor} resolution..."
                 )
                 logger.info(f"Reference resolution buckets: {reference_buckets}")
             else:
-                logger.info("Processing reference videos for IC-LoRA training...")
+                logger.info(f"Processing {len(reference_columns)} reference stream(s) for IC-LoRA training...")
 
-            reference_latents_dir = output_base / "reference_latents"
+            # Output directory naming:
+            #   N=1 -> "reference_latents" (BC with existing single-ref preprocessed datasets)
+            #   N>=2 -> "reference_latents_<column>" per column
+            for ref_column in reference_columns:
+                if len(reference_columns) == 1:
+                    ref_out_dir = output_base / "reference_latents"
+                else:
+                    ref_out_dir = output_base / f"reference_latents_{ref_column}"
+                logger.info(f"Encoding reference column '{ref_column}' -> {ref_out_dir.name}/")
 
-            compute_latents(
-                dataset_file=dataset_file,
-                main_media_column=video_column,
-                video_column=reference_column,
-                resolution_buckets=reference_buckets,
-                output_dir=str(reference_latents_dir),
-                model_path=model_path,
-                batch_size=batch_size,
-                device=device,
-                vae_tiling=vae_tiling,
-            )
+                compute_latents(
+                    dataset_file=dataset_file,
+                    main_media_column=video_column,
+                    video_column=ref_column,
+                    resolution_buckets=reference_buckets,
+                    output_dir=str(ref_out_dir),
+                    model_path=model_path,
+                    batch_size=batch_size,
+                    device=device,
+                    vae_tiling=vae_tiling,
+                )
 
     # Handle decoding if requested (for verification)
     if decode:
@@ -148,11 +157,17 @@ def preprocess_dataset(  # noqa: PLR0913
         decoder.decode(latents_dir, output_base / "decoded_videos")
 
         # Also decode reference videos if they exist
-        if reference_column:
-            reference_latents_dir = output_base / "reference_latents"
-            if reference_latents_dir.exists():
-                logger.info("Decoding reference videos...")
-                decoder.decode(reference_latents_dir, output_base / "decoded_reference_videos")
+        if reference_columns:
+            for ref_column in reference_columns:
+                if len(reference_columns) == 1:
+                    ref_out_dir = output_base / "reference_latents"
+                    decoded_ref_dir = output_base / "decoded_reference_videos"
+                else:
+                    ref_out_dir = output_base / f"reference_latents_{ref_column}"
+                    decoded_ref_dir = output_base / f"decoded_reference_videos_{ref_column}"
+                if ref_out_dir.exists():
+                    logger.info(f"Decoding reference videos for '{ref_column}'...")
+                    decoder.decode(ref_out_dir, decoded_ref_dir)
 
         # Decode audio latents if they exist
         if with_audio and audio_latents_dir and audio_latents_dir.exists():
@@ -161,8 +176,12 @@ def preprocess_dataset(  # noqa: PLR0913
 
     # Print summary
     logger.info(f"Dataset preprocessing complete! Results saved to {output_base}")
-    if reference_column:
-        logger.info("Reference videos processed and saved to reference_latents/ directory for IC-LoRA training")
+    if reference_columns:
+        if len(reference_columns) == 1:
+            logger.info("Reference videos processed and saved to reference_latents/ for IC-LoRA training")
+        else:
+            names = ", ".join(f"reference_latents_{c}/" for c in reference_columns)
+            logger.info(f"Reference videos processed and saved to {names} for multi-reference IC-LoRA training")
     if with_audio:
         logger.info("Audio latents saved to audio_latents/ directory for audio-video training")
 
@@ -235,9 +254,16 @@ def main(  # noqa: PLR0913
         default=False,
         help="Remove LLM prefixes from captions",
     ),
-    reference_column: str | None = typer.Option(
-        default=None,
-        help="Column name containing reference video paths (for video-to-video training)",
+    reference_columns: list[str] | None = typer.Option(
+        None,
+        "--reference-column",
+        help=(
+            "Column name(s) containing reference video paths (for video-to-video / IC-LoRA training). "
+            "Pass the flag multiple times to preprocess multiple reference streams "
+            "(e.g. --reference-column style_ref --reference-column motion_ref). "
+            "With a single column, output goes to 'reference_latents/'; with multiple, "
+            "each stream is written to 'reference_latents_<column>/'."
+        ),
     ),
     with_audio: bool = typer.Option(
         default=False,
@@ -272,6 +298,12 @@ def main(  # noqa: PLR0913
         python scripts/process_dataset.py dataset.json --resolution-buckets 768x768x25 \\
             --model-path /path/to/ltx2.safetensors --text-encoder-path /path/to/gemma \\
             --reference-column "reference_path" --reference-downscale-factor 2
+        # Process dataset with MULTIPLE reference streams (multi-reference IC-LoRA)
+        # Each stream is written to reference_latents_<column>/ and should be listed
+        # in training_strategy.reference_latents_dirs in the training YAML.
+        python scripts/process_dataset.py dataset.json --resolution-buckets 768x768x25 \\
+            --model-path /path/to/ltx2.safetensors --text-encoder-path /path/to/gemma \\
+            --reference-column "style_ref" --reference-column "motion_ref"
         # Process dataset with audio for audio-video training
         python scripts/process_dataset.py dataset.json --resolution-buckets 768x512x97 \\
             --model-path /path/to/ltx2.safetensors --text-encoder-path /path/to/gemma \\
@@ -289,7 +321,7 @@ def main(  # noqa: PLR0913
     if reference_downscale_factor < 1:
         raise typer.BadParameter("--reference-downscale-factor must be >= 1")
 
-    if reference_downscale_factor > 1 and not reference_column:
+    if reference_downscale_factor > 1 and not reference_columns:
         logger.warning("--reference-downscale-factor specified but no --reference-column provided. Ignoring.")
 
     preprocess_dataset(
@@ -306,7 +338,7 @@ def main(  # noqa: PLR0913
         text_encoder_path=text_encoder_path,
         device=device,
         remove_llm_prefixes=remove_llm_prefixes,
-        reference_column=reference_column,
+        reference_columns=reference_columns,
         reference_downscale_factor=reference_downscale_factor,
         with_audio=with_audio,
         load_text_encoder_in_8bit=load_text_encoder_in_8bit,

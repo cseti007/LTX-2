@@ -85,7 +85,7 @@ class GenerationConfig:
     guidance_scale: float = 4.0  # CFG guidance scale
     seed: int = 42  # Random seed for reproducibility
     condition_image: Tensor | None = None  # Optional first frame image for image-to-video
-    reference_video: Tensor | None = None  # For IC-LoRA: [F, C, H, W] in [0, 1]
+    reference_videos: list[Tensor] | None = None  # For IC-LoRA: list of [F, C, H, W] in [0, 1] (concatenated in order)
     reference_downscale_factor: int = 1  # For IC-LoRA: downscale factor (1 = same resolution, 2 = half resolution)
     generate_audio: bool = True  # Whether to generate audio alongside video
     include_reference_in_output: bool = False  # For IC-LoRA: concatenate original reference with generated output
@@ -175,7 +175,7 @@ class ValidationSampler:
         self._validate_config(config)
 
         # Route to appropriate generation method
-        if config.reference_video is not None:
+        if config.reference_videos:
             return self._generate_with_reference(config, device)
         return self._generate_standard(config, device)
 
@@ -236,14 +236,15 @@ class ValidationSampler:
         return video_output, audio_output
 
     def _generate_with_reference(self, config: GenerationConfig, device: torch.device) -> tuple[Tensor, Tensor | None]:
-        """Generate with reference video conditioning (IC-LoRA style).
+        """Generate with reference video conditioning (IC-LoRA style, N-way).
         For IC-LoRA:
-        - Reference video latents are concatenated with target latents
+        - Each reference video is preprocessed and encoded, then all references are
+          concatenated (in order) with the target latents
         - Reference latents have timestep=0 (clean, not denoised)
         - Target latents are denoised normally
         - If condition_image is also provided, the first frame of the target is conditioned
-        - If include_reference_in_output is True, the preprocessed reference video
-          is concatenated side-by-side with the generated video
+        - If include_reference_in_output is True, every preprocessed reference video is
+          concatenated side-by-side with the generated output (left-to-right order)
         """
         # Get prompt embeddings (from cache or encode on-the-fly)
         v_ctx_pos, a_ctx_pos, v_ctx_neg, a_ctx_neg = self._get_prompt_embeddings(config, device)
@@ -251,18 +252,27 @@ class ValidationSampler:
         # Setup generator
         generator = torch.Generator(device=device).manual_seed(config.seed)
 
-        # Preprocess and encode reference video
-        ref_video_preprocessed = self._preprocess_reference_video(config)
-        ref_latent, ref_positions = self._encode_video(ref_video_preprocessed, config.frame_rate, device)
-        ref_seq_len = ref_latent.shape[1]
+        # Preprocess and encode every reference video
+        ref_preprocessed_list: list[Tensor] = []
+        ref_latents_list: list[Tensor] = []
+        ref_positions_list: list[Tensor] = []
+        for ref_video in config.reference_videos:
+            preprocessed = self._preprocess_reference_video(ref_video, config)
+            latent, positions = self._encode_video(preprocessed, config.frame_rate, device)
+            # Scale reference positions to match target coordinate space
+            # Position tensor shape: [B, 3, seq_len, 2] where dim 1 is (time, height, width)
+            if config.reference_downscale_factor != 1:
+                positions = positions.clone()
+                positions[:, 1, ...] *= config.reference_downscale_factor  # height axis
+                positions[:, 2, ...] *= config.reference_downscale_factor  # width axis
+                # Time axis (index 0) remains unchanged
+            ref_preprocessed_list.append(preprocessed)
+            ref_latents_list.append(latent)
+            ref_positions_list.append(positions)
 
-        # Scale reference positions to match target coordinate space
-        # Position tensor shape: [B, 3, seq_len, 2] where dim 1 is (time, height, width)
-        if config.reference_downscale_factor != 1:
-            ref_positions = ref_positions.clone()
-            ref_positions[:, 1, ...] *= config.reference_downscale_factor  # height axis
-            ref_positions[:, 2, ...] *= config.reference_downscale_factor  # width axis
-            # Time axis (index 0) remains unchanged
+        total_ref_seq_len = sum(latent.shape[1] for latent in ref_latents_list)
+        all_ref_latents = torch.cat(ref_latents_list, dim=1)
+        all_ref_positions = torch.cat(ref_positions_list, dim=2)
 
         # Create target video state
         video_tools = self._create_video_latent_tools(config)
@@ -274,14 +284,14 @@ class ValidationSampler:
                 target_clean_state, config.condition_image, config, device
             )
 
-        # Create combined state (reference + target)
+        # Create combined state (all references, then target)
         # denoise_mask shape is [B, seq_len, 1] after patchification
-        ref_denoise_mask = torch.zeros(1, ref_seq_len, 1, device=device, dtype=torch.float32)
+        ref_denoise_mask = torch.zeros(1, total_ref_seq_len, 1, device=device, dtype=torch.float32)
         combined_clean_state = LatentState(
-            latent=torch.cat([ref_latent, target_clean_state.latent], dim=1),
+            latent=torch.cat([all_ref_latents, target_clean_state.latent], dim=1),
             denoise_mask=torch.cat([ref_denoise_mask, target_clean_state.denoise_mask], dim=1),
-            positions=torch.cat([ref_positions, target_clean_state.positions], dim=2),
-            clean_latent=torch.cat([ref_latent, target_clean_state.clean_latent], dim=1),
+            positions=torch.cat([all_ref_positions, target_clean_state.positions], dim=2),
+            clean_latent=torch.cat([all_ref_latents, target_clean_state.clean_latent], dim=1),
         )
 
         # Add noise (only to the target portion via denoise_mask)
@@ -310,17 +320,20 @@ class ValidationSampler:
         )
 
         # Extract target portion and decode
-        target_latent = combined_state.latent[:, ref_seq_len:]
+        target_latent = combined_state.latent[:, total_ref_seq_len:]
         video_output = self._decode_video_latent(target_latent, config, device)
 
-        # Optionally concatenate original reference video side-by-side
+        # Optionally concatenate every original reference video side-by-side with the output
+        # Final layout (left-to-right): ref_1, ref_2, ..., ref_N, generated_output
         if config.include_reference_in_output:
-            # Use preprocessed reference (already resized/cropped, in pixel space)
-            # Convert from [B, C, F, H, W] to [C, F, H, W]
-            ref_video_pixels = ref_video_preprocessed[0].cpu()
-            # Normalize from [-1, 1] to [0, 1]
-            ref_video_pixels = ((ref_video_pixels + 1.0) / 2.0).clamp(0.0, 1.0)
-            video_output = self._concatenate_videos_side_by_side(ref_video_pixels, video_output)
+            # Use preprocessed refs (already resized/cropped, in pixel space).
+            # Convert each from [B, C, F, H, W] in [-1, 1] to [C, F, H, W] in [0, 1].
+            panels = [((p[0].cpu() + 1.0) / 2.0).clamp(0.0, 1.0) for p in ref_preprocessed_list]
+            panels.append(video_output)
+            combined = panels[0]
+            for nxt in panels[1:]:
+                combined = self._concatenate_videos_side_by_side(combined, nxt)
+            video_output = combined
 
         # Decode audio
         audio_output = None
@@ -386,17 +399,17 @@ class ValidationSampler:
         )
 
     @staticmethod
-    def _preprocess_reference_video(config: GenerationConfig) -> Tensor:
-        """Preprocess reference video: resize, crop, and convert to model input format.
+    def _preprocess_reference_video(ref_video: Tensor, config: GenerationConfig) -> Tensor:
+        """Preprocess a single reference video: resize, crop, and convert to model input format.
         When reference_downscale_factor > 1, the reference video is downscaled to a smaller
         resolution for more efficient inference. The positions will be scaled up later
         to match the target coordinate space.
         Args:
-            config: Generation configuration
+            ref_video: Reference video tensor [F, C, H, W] in [0, 1]
+            config: Generation configuration (used for target dims and scale factor)
         Returns:
             Preprocessed video tensor [B, C, F, H, W] in [-1, 1] range
         """
-        ref_video = config.reference_video  # [F, C, H, W] in [0, 1]
         scale_factor = config.reference_downscale_factor
 
         # Target dimensions for reference (scaled down if scale_factor > 1)
@@ -675,7 +688,7 @@ class ValidationSampler:
             raise ValueError("Audio generation requires audio_decoder and vocoder")
         if config.condition_image is not None and self._vae_encoder is None:
             raise ValueError("Image conditioning requires vae_encoder")
-        if config.reference_video is not None and self._vae_encoder is None:
+        if config.reference_videos and self._vae_encoder is None:
             raise ValueError("Reference video conditioning requires vae_encoder")
 
         # Validate prompt embedding source

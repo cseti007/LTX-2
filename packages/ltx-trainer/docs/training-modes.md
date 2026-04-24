@@ -131,7 +131,8 @@ model:
 training_strategy:
   name: "video_to_video"
   first_frame_conditioning_p: 0.1
-  reference_latents_dir: "reference_latents"  # Directory for reference video latents
+  reference_latents_dirs:                     # List of directories (one per reference)
+    - "reference_latents"
 ```
 
 **Example configuration file:**
@@ -140,10 +141,12 @@ training_strategy:
 
 ### Dataset Requirements for IC-LoRA
 
-- Your dataset must contain **paired videos** where each target video has a corresponding reference video
-- Reference and target videos must have the **same frame count** (length)
+- Your dataset must contain **paired videos** where each target video has one or more corresponding reference videos
+- Reference frame counts are **unconstrained** — they may match, be shorter than, or exceed the target length
 - Reference videos can optionally be at **lower spatial resolution** than target videos (
   see [Scaled Reference Conditioning](#scaled-reference-conditioning) below)
+- For **multi-reference** training, all references must share the same spatial resolution (H × W);
+  frame counts may differ per reference
 - Both reference and target videos should be **preprocessed** before training
 
 **Dataset structure for IC-LoRA training:**

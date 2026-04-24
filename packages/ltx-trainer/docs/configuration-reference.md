@@ -168,18 +168,22 @@ training_strategy:
 training_strategy:
   name: "video_to_video"
   first_frame_conditioning_p: 0.1
-  reference_latents_dir: "reference_latents"  # Directory for reference video latents
+  reference_latents_dirs:                     # List of directories (one per reference)
+    - "reference_latents"
+    # For multi-reference conditioning, add more entries here.
+    # All referenced directories must share the same spatial resolution (H × W).
+    # Frame counts may differ across references.
 ```
 
 **Key parameters:**
 
-| Parameter                    | Description                                                      |
-|------------------------------|------------------------------------------------------------------|
-| `name`                       | Strategy type: `"text_to_video"` or `"video_to_video"`           |
-| `first_frame_conditioning_p` | Probability of using first frame as conditioning (0.0-1.0)       |
-| `with_audio`                 | (text_to_video only) Enable joint audio-video training           |
-| `audio_latents_dir`          | (text_to_video only) Directory name for audio latents            |
-| `reference_latents_dir`      | (video_to_video only) Directory name for reference video latents |
+| Parameter                    | Description                                                                          |
+|------------------------------|--------------------------------------------------------------------------------------|
+| `name`                       | Strategy type: `"text_to_video"` or `"video_to_video"`                               |
+| `first_frame_conditioning_p` | Probability of using first frame as conditioning (0.0-1.0)                           |
+| `with_audio`                 | (text_to_video only) Enable joint audio-video training                               |
+| `audio_latents_dir`          | (text_to_video only) Directory name for audio latents                                |
+| `reference_latents_dirs`     | (video_to_video only) List of directories holding reference latents (order matters)  |
 
 ### OptimizationConfig
 

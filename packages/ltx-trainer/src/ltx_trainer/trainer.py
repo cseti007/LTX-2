@@ -949,12 +949,13 @@ class LtxvTrainer:
                 # Convert PIL image to tensor [C, H, W] in [0, 1]
                 condition_image = F.to_tensor(image)
 
-            # Load reference video if provided (for IC-LoRA)
-            reference_video = None
+            # Load reference videos if provided (for IC-LoRA; one INNER LIST per prompt,
+            # holding one or more reference paths for multi-reference conditioning).
+            reference_videos = None
             if use_reference_videos:
-                ref_video_path = self._config.validation.reference_videos[prompt_idx]
+                ref_video_paths = self._config.validation.reference_videos[prompt_idx]
                 # read_video returns [F, C, H, W] in [0, 1]
-                reference_video, _ = read_video(ref_video_path, max_frames=num_frames)
+                reference_videos = [read_video(p, max_frames=num_frames)[0] for p in ref_video_paths]
 
             # Get cached embeddings for this prompt if available
             cached_embeddings = (
@@ -975,7 +976,7 @@ class LtxvTrainer:
                 guidance_scale=self._config.validation.guidance_scale,
                 seed=self._config.validation.seed,
                 condition_image=condition_image,
-                reference_video=reference_video,
+                reference_videos=reference_videos,
                 reference_downscale_factor=self._config.validation.reference_downscale_factor,
                 generate_audio=generate_audio,
                 include_reference_in_output=self._config.validation.include_reference_in_output,

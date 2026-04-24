@@ -108,9 +108,17 @@ training_strategy:
   # Increase this value to train the model to perform better in image-to-video (I2V) mode
   first_frame_conditioning_p: 0.2
 
-  # Directory name (within preprocessed_data_root) containing reference video latents
-  # These are the conditioning inputs that guide the transformation
-  reference_latents_dir: "reference_latents"
+  # Directory names (within preprocessed_data_root) containing reference video latents.
+  # All references are concatenated in this order before the target during training.
+  # Use a single-element list for standard IC-LoRA, or multiple for multi-reference conditioning.
+  # Requirement: all referenced directories must contain latents with the same SPATIAL resolution
+  # (height × width). Frame counts MAY differ across references (e.g. a short gradient-signal ref
+  # paired with a longer content-pool ref).
+  reference_latents_dirs:
+    - "reference_latents"
+    # Multi-reference example (same H×W, frame counts may differ):
+    # - "reference_latents_gradient"
+    # - "reference_latents_source"
 
 # -----------------------------------------------------------------------------
 # Optimization Configuration
@@ -193,12 +201,17 @@ validation:
     - "A man in a casual blue jacket walks along a winding path through a lush green park on a bright sunny afternoon. Tall oak trees line the pathway, their leaves rustling gently in the breeze. Dappled sunlight creates shifting patterns on the ground as he strolls at a relaxed pace, occasionally looking up at the scenery around him. The audio captures footsteps on gravel, birds singing in the trees, distant children playing, and the soft whisper of wind through the foliage."
     - "A fluffy orange tabby cat sits perfectly still on a wooden windowsill, its green eyes intently tracking small birds hopping on a branch just outside the glass. The cat's ears twitch and rotate, following every movement. Warm afternoon light illuminates its fur, creating a soft golden glow. Behind the cat, a cozy living room with a bookshelf and houseplants is visible. The audio features gentle purring, occasional soft meows, muffled bird chirps through the window, and quiet ambient room sounds."
 
-  # Reference videos for validation (REQUIRED for video_to_video strategy)
-  # Must provide one reference video per prompt
-  # These are the conditioning inputs for generating validation outputs
+  # Reference videos for validation (REQUIRED for video_to_video strategy).
+  # Structure: one INNER LIST per validation prompt. Each inner list holds 1+ reference paths.
+  # All inner lists must have the same length, matching training_strategy.reference_latents_dirs.
+  # For multi-reference IC-LoRA, the order of paths within each inner list must correspond
+  # to the order of directories in training_strategy.reference_latents_dirs.
   reference_videos:
-    - "/path/to/reference_video_1.mp4"
-    - "/path/to/reference_video_2.mp4"
+    - ["/path/to/reference_video_1.mp4"]  # refs for prompt 1 (one per entry in reference_latents_dirs)
+    - ["/path/to/reference_video_2.mp4"]  # refs for prompt 2
+    # Multi-reference example (requires matching reference_latents_dirs with the same length):
+    # - ["/path/to/style_ref_1.mp4", "/path/to/motion_ref_1.mp4"]
+    # - ["/path/to/style_ref_2.mp4", "/path/to/motion_ref_2.mp4"]
 
   # Downscale factor for reference videos (for efficient IC-LoRA training)
   # When > 1, reference videos are processed at 1/n resolution
