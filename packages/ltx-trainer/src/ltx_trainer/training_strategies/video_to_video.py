@@ -19,6 +19,8 @@ from ltx_trainer.training_strategies.base_strategy import (
     ModelInputs,
     TrainingStrategy,
     TrainingStrategyConfigBase,
+    _broadcast_sigma,
+    _sample_noise_like,
 )
 
 
@@ -101,6 +103,9 @@ class VideoToVideoStrategy(TrainingStrategy):
         self,
         batch: dict[str, Any],
         timestep_sampler: TimestepSampler,
+        *,
+        override_sigma: float | Tensor | None = None,
+        noise_generator: torch.Generator | None = None,
     ) -> ModelInputs:
         """Prepare inputs for IC-LoRA training with reference videos."""
         # Get pre-encoded latents - dataset provides uniform non-patchified format [B, C, F, H, W]
@@ -198,9 +203,12 @@ class VideoToVideoStrategy(TrainingStrategy):
         # Combined conditioning mask
         conditioning_mask = torch.cat([ref_conditioning_mask, target_conditioning_mask], dim=1)
 
-        # Sample noise and sigmas for target
-        sigmas = timestep_sampler.sample_for(target_latents)
-        noise = torch.randn_like(target_latents)
+        # Sample noise and sigmas for target (or use deterministic overrides for val loss)
+        if override_sigma is None:
+            sigmas = timestep_sampler.sample_for(target_latents)
+        else:
+            sigmas = _broadcast_sigma(override_sigma, batch_size, device, target_latents.dtype)
+        noise = _sample_noise_like(target_latents, noise_generator)
         sigmas_expanded = sigmas.view(-1, 1, 1)
 
         # Apply noise to target

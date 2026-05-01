@@ -20,6 +20,8 @@ from ltx_trainer.training_strategies.base_strategy import (
     ModelInputs,
     TrainingStrategy,
     TrainingStrategyConfigBase,
+    _broadcast_sigma,
+    _sample_noise_like,
 )
 
 
@@ -88,6 +90,9 @@ class TextToVideoStrategy(TrainingStrategy):
         self,
         batch: dict[str, Any],
         timestep_sampler: TimestepSampler,
+        *,
+        override_sigma: float | Tensor | None = None,
+        noise_generator: torch.Generator | None = None,
     ) -> ModelInputs:
         """Prepare inputs for text-to-video training."""
         # Get pre-encoded latents - dataset provides uniform non-patchified format [B, C, F, H, W]
@@ -131,9 +136,12 @@ class TextToVideoStrategy(TrainingStrategy):
             first_frame_conditioning_p=self.config.first_frame_conditioning_p,
         )
 
-        # Sample noise and sigmas
-        sigmas = timestep_sampler.sample_for(video_latents)
-        video_noise = torch.randn_like(video_latents)
+        # Sample noise and sigmas (or use deterministic overrides for val loss)
+        if override_sigma is None:
+            sigmas = timestep_sampler.sample_for(video_latents)
+        else:
+            sigmas = _broadcast_sigma(override_sigma, batch_size, device, video_latents.dtype)
+        video_noise = _sample_noise_like(video_latents, noise_generator)
 
         # Apply noise: noisy = (1 - sigma) * clean + sigma * noise
         sigmas_expanded = sigmas.view(-1, 1, 1)
@@ -188,6 +196,7 @@ class TextToVideoStrategy(TrainingStrategy):
                 batch_size=batch_size,
                 device=device,
                 dtype=dtype,
+                noise_generator=noise_generator,
             )
 
         return ModelInputs(
@@ -208,6 +217,7 @@ class TextToVideoStrategy(TrainingStrategy):
         batch_size: int,
         device: torch.device,
         dtype: torch.dtype,
+        noise_generator: torch.Generator | None = None,
     ) -> tuple[Modality, Tensor, Tensor]:
         """Prepare audio inputs for joint audio-video training.
         Args:
@@ -230,8 +240,8 @@ class TextToVideoStrategy(TrainingStrategy):
 
         audio_seq_len = audio_latents.shape[1]
 
-        # Sample audio noise
-        audio_noise = torch.randn_like(audio_latents)
+        # Sample audio noise (deterministic when noise_generator is provided)
+        audio_noise = _sample_noise_like(audio_latents, noise_generator)
 
         # Apply noise to audio (same sigma as video)
         sigmas_expanded = sigmas.view(-1, 1, 1)

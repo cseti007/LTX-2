@@ -27,6 +27,28 @@ DEFAULT_FPS = 24
 VIDEO_SCALE_FACTORS = SpatioTemporalScaleFactors.default()
 
 
+def _sample_noise_like(reference: Tensor, generator: torch.Generator | None) -> Tensor:
+    """torch.randn_like equivalent that optionally honors a deterministic generator.
+    Falls back to randn_like (global RNG) when generator is None.
+    """
+    if generator is None:
+        return torch.randn_like(reference)
+    return torch.randn(reference.shape, generator=generator, device=reference.device, dtype=reference.dtype)
+
+
+def _broadcast_sigma(
+    sigma: float | Tensor, batch_size: int, device: torch.device, dtype: torch.dtype
+) -> Tensor:
+    """Normalize a scalar/tensor sigma override to shape [B,] on the right device/dtype."""
+    if isinstance(sigma, Tensor):
+        if sigma.numel() == 1:
+            return sigma.to(device=device, dtype=dtype).expand(batch_size).clone()
+        if sigma.shape != (batch_size,):
+            raise ValueError(f"override_sigma tensor must be scalar or shape [{batch_size}], got {tuple(sigma.shape)}")
+        return sigma.to(device=device, dtype=dtype)
+    return torch.full((batch_size,), float(sigma), device=device, dtype=dtype)
+
+
 class TrainingStrategyConfigBase(BaseModel):
     """Base configuration class for training strategies.
     All strategy-specific configuration classes should inherit from this.
@@ -96,6 +118,9 @@ class TrainingStrategy(ABC):
         self,
         batch: dict[str, Any],
         timestep_sampler: TimestepSampler,
+        *,
+        override_sigma: float | Tensor | None = None,
+        noise_generator: torch.Generator | None = None,
     ) -> ModelInputs:
         """Prepare training inputs from a raw data batch.
         Args:
@@ -106,7 +131,12 @@ class TrainingStrategy(ABC):
                     - "audio_prompt_embeds": Already processed by embedding connectors
                     - "prompt_attention_mask": Attention mask
                 - Additional keys depending on strategy (e.g., "ref_latents" for IC-LoRA)
-            timestep_sampler: Sampler for generating timesteps and noise
+            timestep_sampler: Sampler for generating timesteps and noise (used only when
+                override_sigma is None)
+            override_sigma: When set, use this sigma instead of sampling. Scalar broadcasts
+                across the batch; tensor must be shape [B,]. Used for deterministic val loss.
+            noise_generator: When set, draw noise from this generator instead of the global
+                RNG. Used for deterministic val loss. Applies to both video and audio noise.
         Returns:
             ModelInputs containing Modality objects and training targets
         """
