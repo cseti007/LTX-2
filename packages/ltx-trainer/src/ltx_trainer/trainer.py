@@ -144,6 +144,7 @@ class LtxvTrainer:
         self._init_wandb(resume_run_id=resume_run_id)
 
         self._init_dataloader()
+        self._init_val_dataloader()
         data_iter = iter(self._dataloader)
         self._init_timestep_sampler()
 
@@ -189,6 +190,7 @@ class LtxvTrainer:
                 sampled_videos_paths = self._sample_videos(progress)
                 if IS_MAIN_PROCESS and sampled_videos_paths and self._config.wandb.log_validation_videos:
                     self._log_validation_samples(sampled_videos_paths, cfg.validation.prompts)
+                self._run_val_loss_if_enabled()
 
             self._accelerator.wait_for_everyone()
 
@@ -233,11 +235,13 @@ class LtxvTrainer:
                             sampled_videos_paths = self._sample_videos(progress)
                             if IS_MAIN_PROCESS and sampled_videos_paths and self._config.wandb.log_validation_videos:
                                 self._log_validation_samples(sampled_videos_paths, cfg.validation.prompts)
+                            self._run_val_loss_if_enabled()
                         # DDP: Only main process runs validation
                         elif IS_MAIN_PROCESS:
                             sampled_videos_paths = self._sample_videos(progress)
                             if sampled_videos_paths and self._config.wandb.log_validation_videos:
                                 self._log_validation_samples(sampled_videos_paths, cfg.validation.prompts)
+                            self._run_val_loss_if_enabled()
 
                     # Save checkpoint if needed
                     if (
@@ -348,8 +352,16 @@ class LtxvTrainer:
 
         return saved_path, stats
 
-    def _training_step(self, batch: dict[str, dict[str, Tensor]]) -> TrainingStepOutput:
-        """Perform a single training step using the configured strategy."""
+    def _forward_loss(
+        self,
+        batch: dict[str, dict[str, Tensor]],
+        *,
+        override_sigma: float | Tensor | None = None,
+        noise_generator: torch.Generator | None = None,
+    ) -> tuple[Tensor, Tensor]:
+        """Run text-encoder connectors + strategy + transformer forward + loss.
+        Returns (loss [B,], sigma [B,]). Used by both _training_step and val loss.
+        """
         # Apply embedding connectors to transform pre-computed text embeddings
         conditions = batch["conditions"]
 
@@ -373,7 +385,12 @@ class LtxvTrainer:
         conditions["prompt_attention_mask"] = attention_mask
 
         # Use strategy to prepare training inputs (returns ModelInputs with Modality objects)
-        model_inputs = self._training_strategy.prepare_training_inputs(batch, self._timestep_sampler)
+        model_inputs = self._training_strategy.prepare_training_inputs(
+            batch,
+            self._timestep_sampler,
+            override_sigma=override_sigma,
+            noise_generator=noise_generator,
+        )
 
         # Run transformer forward pass with Modality-based interface
         video_pred, audio_pred = self._transformer(
@@ -382,10 +399,13 @@ class LtxvTrainer:
             perturbations=None,
         )
 
-        # Use strategy to compute loss
         loss = self._training_strategy.compute_loss(video_pred, audio_pred, model_inputs)
         sigma = model_inputs.video.sigma.detach() if model_inputs.video.enabled else model_inputs.audio.sigma.detach()
+        return loss, sigma
 
+    def _training_step(self, batch: dict[str, dict[str, Tensor]]) -> TrainingStepOutput:
+        """Perform a single training step using the configured strategy."""
+        loss, sigma = self._forward_loss(batch)
         return TrainingStepOutput(loss=loss, sigma=sigma)
 
     @free_gpu_memory_context(after=True)
@@ -761,6 +781,33 @@ class LtxvTrainer:
 
         self._dataloader = self._accelerator.prepare(dataloader)
 
+    def _init_val_dataloader(self) -> None:
+        """Initialize the val-loss data loader from validation.val_data_root.
+
+        Reuses PrecomputedDataset with the same data sources as training. The val
+        DataLoader is shuffle=False and drop_last=False so all val samples are seen
+        deterministically. Only created when validation.compute_val_loss is True.
+        """
+        if not self._config.validation.compute_val_loss:
+            self._val_dataloader = None
+            return
+
+        data_sources = self._training_strategy.get_data_sources()
+        val_dataset = PrecomputedDataset(self._config.validation.val_data_root, data_sources=data_sources)
+        logger.info(f"Loaded val dataset with {len(val_dataset):,} samples from {self._config.validation.val_data_root}")
+
+        num_workers = self._config.data.num_dataloader_workers
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=self._config.optimization.batch_size,
+            shuffle=False,
+            drop_last=False,
+            num_workers=num_workers,
+            pin_memory=num_workers > 0,
+            persistent_workers=num_workers > 0,
+        )
+        self._val_dataloader = self._accelerator.prepare(val_loader)
+
     def _init_lora_weights(self) -> None:
         """Initialize LoRA weights for the transformer."""
         logger.debug("Initializing LoRA weights...")
@@ -1014,6 +1061,102 @@ class LtxvTrainer:
         rel_outputs_path = output_dir.relative_to(self._config.output_dir)
         logger.info(f"🎥 Validation samples for step {self._global_step} saved in {rel_outputs_path}")
         return video_paths
+
+    def _run_val_loss_if_enabled(self) -> None:
+        """Wrapper around `_compute_val_loss` that handles the no-op case cleanly.
+
+        Called from the validation cycle in `train()`. Returns early when val loss
+        is disabled or no val dataloader exists; otherwise runs the val loss pass.
+        """
+        if not self._config.validation.compute_val_loss or self._val_dataloader is None:
+            return
+        self._compute_val_loss()
+
+    @torch.inference_mode()
+    def _compute_val_loss(self) -> dict[str, float] | None:
+        """Compute deterministic validation loss on the held-out val dataset.
+
+        For each val batch and each fixed timestep in `validation.val_loss_timesteps`,
+        runs a forward pass with seeded noise and the strategy's loss. Aggregates per
+        timestep and overall. Logs to WandB as `val/loss` and `val/loss_t<n>`.
+
+        Returns:
+            Dict of metric name -> value (already logged), or None if val loss is
+            disabled or no val data is available.
+        """
+        if not self._config.validation.compute_val_loss or self._val_dataloader is None:
+            return None
+
+        val_cfg = self._config.validation
+        device = self._accelerator.device
+        timesteps = list(val_cfg.val_loss_timesteps)
+        max_samples = val_cfg.val_loss_max_samples
+
+        # Per-timestep accumulators: list of (sum_of_per_item_losses, count)
+        per_timestep_sums: dict[float, float] = {t: 0.0 for t in timesteps}
+        per_timestep_counts: dict[float, int] = {t: 0 for t in timesteps}
+
+        was_training = self._transformer.training
+        self._transformer.eval()
+
+        try:
+            samples_seen = 0
+            for batch_idx, batch in enumerate(self._val_dataloader):
+                if max_samples is not None and samples_seen >= max_samples:
+                    break
+
+                # Determine effective batch size before truncation, for max_samples accounting
+                batch_size = batch["latents"]["latents"].shape[0]
+                samples_seen += batch_size
+
+                for t_idx, sigma in enumerate(timesteps):
+                    # Deterministic per (run, batch, timestep) so the same val data + same
+                    # model produces identical loss. Different across (batch, timestep) so
+                    # we don't reuse identical noise patterns.
+                    seed = val_cfg.val_loss_seed + batch_idx * len(timesteps) + t_idx
+                    gen = torch.Generator(device=device).manual_seed(seed)
+
+                    loss, _sigma = self._forward_loss(batch, override_sigma=sigma, noise_generator=gen)
+                    # loss is shape [B,]; sum and count separately so the timestep mean is correct
+                    # across uneven final batches.
+                    per_timestep_sums[sigma] += float(loss.sum().item())
+                    per_timestep_counts[sigma] += int(loss.numel())
+
+            metrics: dict[str, float] = {}
+            timestep_means: list[float] = []
+            for t in timesteps:
+                count = per_timestep_counts[t]
+                if count == 0:
+                    continue
+                mean = per_timestep_sums[t] / count
+                # Key format: val/loss_t05, val/loss_t95 — sortable in WandB charts
+                metrics[f"val/loss_t{int(round(t * 100)):02d}"] = mean
+                timestep_means.append(mean)
+
+            if not timestep_means:
+                logger.warning("Val loss requested but no val samples were processed; check val_data_root.")
+                return None
+
+            metrics["val/loss"] = sum(timestep_means) / len(timestep_means)
+
+            # Sigma buckets for quick "low/mid/high noise" trend reading
+            low = [m for t, m in zip(timesteps, timestep_means, strict=True) if t < 0.3]
+            high = [m for t, m in zip(timesteps, timestep_means, strict=True) if t >= 0.7]
+            if low:
+                metrics["val/loss_low_sigma"] = sum(low) / len(low)
+            if high:
+                metrics["val/loss_high_sigma"] = sum(high) / len(high)
+
+            self._log_metrics(metrics)
+            logger.info(
+                f"📉 Val loss @ step {self._global_step}: mean={metrics['val/loss']:.4f}"
+                + (f" low={metrics['val/loss_low_sigma']:.4f}" if "val/loss_low_sigma" in metrics else "")
+                + (f" high={metrics['val/loss_high_sigma']:.4f}" if "val/loss_high_sigma" in metrics else "")
+            )
+            return metrics
+        finally:
+            if was_training:
+                self._transformer.train()
 
     @staticmethod
     def _log_training_stats(stats: TrainingStats) -> None:

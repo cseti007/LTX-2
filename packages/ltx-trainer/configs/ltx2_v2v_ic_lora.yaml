@@ -266,6 +266,22 @@ validation:
   # Useful for visually comparing the transformation quality
   include_reference_in_output: true
 
+  # ----- Validation loss tracking (optional) ---------------------------------
+  # When enabled, computes a deterministic val loss alongside the visual val
+  # samples and logs it to WandB. Useful for overfitting detection and for
+  # comparing runs quantitatively. Note: diffusion val loss correlates only
+  # weakly with sample quality — use it as a complement to visual val.
+  compute_val_loss: false
+  # Path to a held-out preprocessed dataset (same layout as data.preprocessed_data_root).
+  # Required when compute_val_loss=true.
+  # val_data_root: "/path/to/val/.precomputed"
+  # Fixed sigma grid used for val loss; eliminates timestep-sampling variance.
+  # val_loss_timesteps: [0.05, 0.15, 0.25, 0.35, 0.45, 0.55, 0.65, 0.75, 0.85, 0.95]
+  # Seed for the noise generator used in val loss; same seed -> same noise across runs.
+  # val_loss_seed: 12345
+  # Optional cap on number of val videos per val loss run (null = use all).
+  # val_loss_max_samples: null
+
 # -----------------------------------------------------------------------------
 # Checkpoint Configuration
 # -----------------------------------------------------------------------------
