@@ -8,7 +8,7 @@ This strategy implements training with reference video conditioning where:
 from typing import Any, Literal
 
 import torch
-from pydantic import Field
+from pydantic import Field, model_validator
 from torch import Tensor
 
 from ltx_core.model.transformer.modality import Modality
@@ -45,6 +45,20 @@ class VideoToVideoConfig(TrainingStrategyConfigBase):
         ),
         min_length=1,
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_legacy_reference_latents_dir(cls, data: Any) -> Any:
+        # BC for pre-N-way configs: `reference_latents_dir: "foo"` (str) was
+        # replaced by `reference_latents_dirs: ["foo"]` (list[str]). Accept the
+        # legacy field by rewriting it into the new one before standard
+        # validation, so existing YAMLs keep loading. The new field wins if both
+        # are present.
+        if isinstance(data, dict) and "reference_latents_dir" in data:
+            legacy = data.pop("reference_latents_dir")
+            if "reference_latents_dirs" not in data:
+                data["reference_latents_dirs"] = [legacy]
+        return data
 
 
 class VideoToVideoStrategy(TrainingStrategy):

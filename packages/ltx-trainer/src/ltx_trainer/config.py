@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Discriminator, Field, Tag, ValidationInfo, field_validator, model_validator
 
@@ -224,6 +224,19 @@ class ValidationConfig(ConfigBaseModel):
             "matching the number of entries in training_strategy.reference_latents_dirs."
         ),
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_legacy_reference_videos(cls, data: Any) -> Any:
+        # BC for pre-N-way configs: `reference_videos: ["a.mp4", "b.mp4"]`
+        # (one path per prompt) was replaced by `list[list[str]]` (per-prompt
+        # list of N reference paths). Detect the legacy flat shape (every entry
+        # is a string) and wrap each entry into a single-element list.
+        if isinstance(data, dict):
+            rv = data.get("reference_videos")
+            if isinstance(rv, list) and rv and all(isinstance(x, str) for x in rv):
+                data["reference_videos"] = [[s] for s in rv]
+        return data
 
     reference_downscale_factor: int = Field(
         default=1,
