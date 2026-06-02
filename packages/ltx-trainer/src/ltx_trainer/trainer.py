@@ -33,6 +33,7 @@ from ltx_core.text_encoders.gemma import convert_to_additive_mask
 from ltx_trainer import logger
 from ltx_trainer.config import LtxTrainerConfig
 from ltx_trainer.config_display import print_config
+from ltx_trainer.cs_fluctuation_tracker import CSFluctuationTracker
 from ltx_trainer.datasets import PrecomputedDataset
 from ltx_trainer.gpu_utils import free_gpu_memory, free_gpu_memory_context, get_gpu_memory_gb
 from ltx_trainer.hf_hub_utils import push_to_hub
@@ -107,6 +108,8 @@ class LtxvTrainer:
         self._training_state_size_warned = False
         self._wandb_run = None
         self._sigma_tracker = SigmaBucketTracker()
+        self._cs_tracker = CSFluctuationTracker(window=self._config.cs_fluctuation.window)
+        self._cs_fsdp_warned = False
 
     def train(  # noqa: PLR0912, PLR0915
         self,
@@ -283,6 +286,7 @@ class LtxvTrainer:
                             "train/global_step": self._global_step,
                         }
                         metrics.update(self._sigma_tracker.get_metrics())
+                        metrics.update(self._compute_cs_fluctuation())
                         self._log_metrics(metrics)
 
                     # Fallback logging when progress bars are disabled
@@ -1368,6 +1372,22 @@ class LtxvTrainer:
             init_kwargs["resume"] = "allow"
         run = wandb.init(**init_kwargs)
         self._wandb_run = run
+
+    def _compute_cs_fluctuation(self) -> dict[str, float]:
+        """Compute the CS-Fluctuation diagnostic for the current step, if enabled.
+
+        Returns an empty dict when disabled, off-interval, or not applicable
+        (no LoRA layers, or FSDP where weights are sharded).
+        """
+        cfg = self._config.cs_fluctuation
+        if not cfg.enabled or self._global_step % cfg.interval != 0:
+            return {}
+        if self._accelerator.distributed_type == DistributedType.FSDP:
+            if not self._cs_fsdp_warned:
+                logger.warning("CS-Fluctuation logging is not supported under FSDP (sharded weights); skipping.")
+                self._cs_fsdp_warned = True
+            return {}
+        return self._cs_tracker.update(self._accelerator.unwrap_model(self._transformer))
 
     def _log_metrics(self, metrics: dict[str, float]) -> None:
         """Log metrics to Weights & Biases."""

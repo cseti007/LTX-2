@@ -564,6 +564,31 @@ class WandbConfig(ConfigBaseModel):
     )
 
 
+class CSFluctuationConfig(ConfigBaseModel):
+    """Configuration for CS-Fluctuation logging (LoRA overfitting-onset diagnostic).
+
+    Logging-only: measures the cosine similarity between each LoRA delta and its
+    base weight and tracks its rolling fluctuation. Does not affect training.
+    """
+
+    enabled: bool = Field(
+        default=False,
+        description="Whether to log the CS-Fluctuation diagnostic (LoRA mode only)",
+    )
+
+    interval: int = Field(
+        default=100,
+        gt=0,
+        description="Compute and log the metric every N optimization steps",
+    )
+
+    window: int = Field(
+        default=20,
+        ge=2,
+        description="Number of recent measurements used for the rolling fluctuation (std)",
+    )
+
+
 class FlowMatchingConfig(ConfigBaseModel):
     """Configuration for flow matching training"""
 
@@ -596,6 +621,7 @@ class LtxTrainerConfig(ConfigBaseModel):
     hub: HubConfig = Field(default_factory=HubConfig)
     flow_matching: FlowMatchingConfig = Field(default_factory=FlowMatchingConfig)
     wandb: WandbConfig = Field(default_factory=WandbConfig)
+    cs_fluctuation: CSFluctuationConfig = Field(default_factory=CSFluctuationConfig)
 
     # General configuration
     seed: int = Field(

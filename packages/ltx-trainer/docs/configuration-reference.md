@@ -349,6 +349,32 @@ wandb:
 | `entity`                | W&B username or team (null uses default account) |
 | `log_validation_videos` | Whether to log validation videos to W&B          |
 
+### CSFluctuationConfig
+
+CS-Fluctuation logging: a diagnostic for detecting the onset of LoRA overfitting. For each LoRA layer it measures the
+cosine similarity between the adapter's weight delta (`scaling * B @ A`) and its frozen base weight, averages across
+layers, and tracks how much that average fluctuates over a rolling window. When the fluctuation flattens out, it signals
+the onset of overfitting. This is logging-only (read under `no_grad`) and does not affect the loss, gradients, or the
+optimizer. Applies to LoRA training only; not supported under FSDP (sharded weights).
+
+```yaml
+cs_fluctuation:
+  enabled: false  # Enable CS-Fluctuation logging (LoRA mode only)
+  interval: 100   # Compute and log every N optimization steps
+  window: 20      # Recent measurements used for the rolling fluctuation (std)
+```
+
+**Key parameters:**
+
+| Parameter  | Description                                                          |
+|------------|---------------------------------------------------------------------|
+| `enabled`  | Whether to log the CS-Fluctuation diagnostic                        |
+| `interval` | Compute and log the metric every N optimization steps               |
+| `window`   | Number of recent measurements used for the rolling fluctuation std  |
+
+Logged metrics: `cs/mean`, `cs/min`, `cs/max` (per-layer cosine aggregated across layers) and `cs/fluctuation` (rolling
+standard deviation of `cs/mean`).
+
 ### FlowMatchingConfig
 
 Flow matching training configuration for timestep sampling.

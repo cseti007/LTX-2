@@ -311,6 +311,23 @@ wandb:
   log_validation_videos: true
 
 # -----------------------------------------------------------------------------
+# CS-Fluctuation Configuration
+# -----------------------------------------------------------------------------
+# Logging-only diagnostic for LoRA overfitting onset. Measures the cosine
+# similarity between each LoRA weight delta and its base weight, then tracks how
+# much that average fluctuates over a rolling window. When the fluctuation
+# flattens out, it signals the onset of overfitting. Does not affect training.
+cs_fluctuation:
+  # Enable CS-Fluctuation logging (LoRA mode only)
+  enabled: false
+
+  # Compute and log the metric every N optimization steps
+  interval: 100
+
+  # Number of recent measurements used for the rolling fluctuation (std)
+  window: 20
+
+# -----------------------------------------------------------------------------
 # General Configuration
 # -----------------------------------------------------------------------------
 # Global settings for the training run.
