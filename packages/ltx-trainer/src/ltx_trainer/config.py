@@ -655,6 +655,20 @@ class LtxTrainerConfig(ConfigBaseModel):
                 "reference_videos must be provided in validation config when using video_to_video strategy"
             )
 
+        # Check that the per-prompt reference count matches the training reference dirs.
+        # The validation sampler concatenates one reference per reference_latents_dirs entry,
+        # so each prompt must provide exactly that many paths. Per-prompt lengths are already
+        # validated to be equal in ValidationConfig, so checking the first is sufficient.
+        if self.training_strategy.name == "video_to_video" and self.validation.reference_videos:
+            expected = len(self.training_strategy.reference_latents_dirs)
+            actual = len(self.validation.reference_videos[0])
+            if actual != expected:
+                raise ValueError(
+                    f"validation.reference_videos provides {actual} reference(s) per prompt, but "
+                    f"training_strategy.reference_latents_dirs has {expected} "
+                    f"entr{'y' if expected == 1 else 'ies'}. They must match for IC-LoRA validation."
+                )
+
         # Check that LoRA config is provided when training mode is lora
         if self.model.training_mode == "lora" and self.lora is None:
             raise ValueError("LoRA configuration must be provided when training_mode is 'lora'")
