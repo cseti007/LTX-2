@@ -1450,9 +1450,16 @@ class LtxvTrainer:
         return self._cs_tracker.update(self._accelerator.unwrap_model(self._transformer))
 
     def _log_metrics(self, metrics: dict[str, float]) -> None:
-        """Log metrics to Weights & Biases."""
+        """Log metrics to Weights & Biases.
+
+        Always log against the explicit ``global_step`` so the W&B step axis stays consistent with
+        ``_log_validation_samples`` (which logs videos at ``step=global_step``). Without this, the
+        metric logs auto-increment W&B's internal step counter past ``global_step`` (the extra val-loss
+        log calls accelerate this), and the validation-video logs are then silently dropped with
+        "Tried to log to step N that is less than the current step M".
+        """
         if self._wandb_run is not None:
-            self._wandb_run.log(metrics)
+            self._wandb_run.log(metrics, step=self._global_step)
 
     def _log_validation_samples(self, sample_paths: list[Path], prompts: list[str]) -> None:
         """Log validation samples (videos or images) to Weights & Biases."""
