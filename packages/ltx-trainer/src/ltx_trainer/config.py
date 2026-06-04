@@ -122,12 +122,14 @@ class OptimizationConfig(ConfigBaseModel):
         description="Maximum gradient norm for clipping",
     )
 
-    optimizer_type: Literal["adamw", "adamw8bit", "prodigy"] = Field(
+    optimizer_type: Literal["adamw", "adamw8bit", "prodigy", "prodigy_plus_schedulefree"] = Field(
         default="adamw",
         description=(
             "Type of optimizer to use for training. "
             "'prodigy' uses prodigyopt's D-Adaptation optimizer which automatically "
-            "tunes the learning rate — set learning_rate=1.0 when using it."
+            "tunes the learning rate — set learning_rate=1.0 when using it. "
+            "'prodigy_plus_schedulefree' uses the prodigy-plus-schedule-free optimizer "
+            "(D-Adaptation + Schedule-Free); also set learning_rate=1.0 and scheduler_type='constant'."
         ),
     )
 
@@ -136,7 +138,8 @@ class OptimizationConfig(ConfigBaseModel):
         description=(
             "Extra keyword arguments forwarded verbatim to the optimizer constructor. "
             "Useful for optimizer-specific settings, e.g. for Prodigy: "
-            "{d_coef: 1.0, use_bias_correction: true, safeguard_warmup: true, weight_decay: 0.01}."
+            "{d_coef: 1.0, use_bias_correction: true, safeguard_warmup: true, weight_decay: 0.01}. "
+            "For prodigy_plus_schedulefree, e.g.: {betas: [0.95, 0.99], prodigy_steps: 250}."
         ),
     )
 
@@ -161,6 +164,18 @@ class OptimizationConfig(ConfigBaseModel):
         default=False,
         description="Enable gradient checkpointing to save memory at the cost of slower training",
     )
+
+    @model_validator(mode="after")
+    def validate_schedulefree_scheduler(self) -> "OptimizationConfig":
+        # Schedule-Free optimizers perform their own learning-rate averaging; layering a
+        # decaying scheduler on top would double-decay and break the schedule-free behaviour.
+        if self.optimizer_type == "prodigy_plus_schedulefree" and self.scheduler_type != "constant":
+            raise ValueError(
+                "optimizer_type='prodigy_plus_schedulefree' requires scheduler_type='constant' "
+                f"(got '{self.scheduler_type}'). Schedule-Free handles learning-rate decay internally; "
+                "a decaying scheduler would conflict with it."
+            )
+        return self
 
 
 class AccelerationConfig(ConfigBaseModel):
