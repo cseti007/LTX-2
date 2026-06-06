@@ -2,10 +2,18 @@
 
 Implements the diagnostic from "Towards Personalized AI: Early-stopping Low-Rank
 Adaptation of Foundation Models" (CS-Fluctuation). For every LoRA layer it
-measures the cosine similarity between the adapter's weight delta
-(scaling * B @ A) and its frozen base weight W0, averages across layers, and
-tracks how much that average fluctuates over a rolling window of measurements.
-When the fluctuation flattens out, it signals the onset of overfitting.
+measures the cosine similarity (CS) between the adapter's weight delta
+(scaling * B @ A) and its frozen base weight W0, and averages across layers
+(paper Eq. 2). It then tracks the *fluctuation* of that CS signal: the variance
+of the smoothed CS slope, normalized by the learning rate (paper Eq. 3-4). When
+the fluctuation becomes small, the CS has steadied -- the onset of overfitting.
+
+Note on causality: the paper defines the moving-window average over a forward
+window (j .. j+M), an offline computation. For online logging during training we
+use a *trailing* window (j-M .. j) so the metric is available at step j; this
+preserves the shape of the curve, shifted by the window. Because of the two
+moving averages plus the variance window, the fluctuation only becomes available
+after ~3*window measurements (it is omitted from the returned dict until then).
 
 This is a logging-only diagnostic: it reads weights under no_grad and never
 affects the loss, gradients, or the optimizer.
@@ -18,18 +26,22 @@ from peft.tuners.tuners_utils import BaseTunerLayer
 
 
 class CSFluctuationTracker:
-    """Track LoRA-vs-base cosine similarity and its rolling fluctuation.
+    """Track LoRA-vs-base cosine similarity and its CS-Fluctuation (paper Eq. 2-4).
 
     Each call to update() walks the LoRA layers of a PEFT model, computes the
     per-layer cosine between the adapter delta and the base weight, and returns
-    the mean (plus min/max) across layers along with the standard deviation of
-    the mean over the last `window` measurements ("CS-Fluctuation").
+    the mean (plus min/max) across layers. It also maintains a rolling history of
+    the mean CS and, once enough history has accumulated, reports the smoothed CS
+    slope ("cs/slope") and the CS-Fluctuation ("cs/fluctuation").
     """
 
     def __init__(self, window: int = 20) -> None:
         if window < 2:
             raise ValueError("window must be >= 2")
-        self._history: deque[float] = deque(maxlen=window)
+        self._window = window
+        # Eq. 4 chains two moving averages (window M) and a variance window (M),
+        # so it needs ~3*M raw CS measurements before it can be evaluated.
+        self._history: deque[float] = deque(maxlen=3 * window)
 
     @staticmethod
     def _layer_cosine(module: BaseTunerLayer, adapter: str) -> float | None:
@@ -53,11 +65,40 @@ class CSFluctuationTracker:
             return None
         return float(inner / denom)
 
-    @torch.no_grad()
-    def update(self, model: torch.nn.Module) -> dict[str, float]:
-        """Measure mean LoRA-vs-base cosine across layers and its fluctuation.
+    @staticmethod
+    def _trailing_ma(xs: list[float], m: int) -> list[float]:
+        """Trailing moving average: out[t] = mean(xs[t-m+1 : t+1]) for t >= m-1."""
+        if len(xs) < m:
+            return []
+        return [sum(xs[t - m + 1 : t + 1]) / m for t in range(m - 1, len(xs))]
 
-        Returns an empty dict when the model has no LoRA layers.
+    @classmethod
+    def _fluctuation(cls, cs: list[float], m: int, lr: float) -> tuple[float | None, float | None]:
+        """CS-Fluctuation (Eq. 3-4) and the current smoothed CS slope, causal form.
+
+        Returns (fluctuation, slope). Either is None until enough history exists.
+        ma1 = MA(CS); slope = grad(ma1); X = MA(slope); fluctuation = var(X[-m:]) / lr.
+        """
+        ma1 = cls._trailing_ma(cs, m)  # MA(CS)  -- Eq. 3
+        if len(ma1) < 2:
+            return None, None
+        slope = [ma1[i] - ma1[i - 1] for i in range(1, len(ma1))]  # grad(MA(CS))
+        x = cls._trailing_ma(slope, m)  # MA(grad(MA(CS))) -- smoothed slope
+        cur_slope = slope[-1]
+        if len(x) < m:
+            return None, cur_slope
+        win = x[-m:]
+        mean_x = sum(win) / m
+        var = sum((v - mean_x) ** 2 for v in win) / m  # Eq. 4 variance
+        denom = abs(lr) if lr else 1.0  # normalize by lr (paper Eq. 4)
+        return var / denom, cur_slope
+
+    @torch.no_grad()
+    def update(self, model: torch.nn.Module, lr: float = 1.0) -> dict[str, float]:
+        """Measure mean LoRA-vs-base cosine across layers and its CS-Fluctuation.
+
+        ``lr`` is the effective learning rate used to normalize the fluctuation
+        (paper Eq. 4). Returns an empty dict when the model has no LoRA layers.
         """
         cosines: list[float] = []
         for module in model.modules():
@@ -76,6 +117,9 @@ class CSFluctuationTracker:
             "cs/min": min(cosines),
             "cs/max": max(cosines),
         }
-        if len(self._history) >= 2:
-            metrics["cs/fluctuation"] = float(torch.tensor(list(self._history)).std(unbiased=False))
+        fluctuation, slope = self._fluctuation(list(self._history), self._window, lr)
+        if slope is not None:
+            metrics["cs/slope"] = slope
+        if fluctuation is not None:
+            metrics["cs/fluctuation"] = fluctuation
         return metrics

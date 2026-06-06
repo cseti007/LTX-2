@@ -1447,7 +1447,11 @@ class LtxvTrainer:
                 logger.warning("CS-Fluctuation logging is not supported under FSDP (sharded weights); skipping.")
                 self._cs_fsdp_warned = True
             return {}
-        return self._cs_tracker.update(self._accelerator.unwrap_model(self._transformer))
+        # Effective step size for the Eq. 4 lr-normalization: prodigy adapts via "d", so the
+        # effective lr is d*lr; standard optimizers use lr directly.
+        pg = self._optimizer.param_groups[0]
+        effective_lr = pg["d"] * pg["lr"] if "d" in pg else pg["lr"]
+        return self._cs_tracker.update(self._accelerator.unwrap_model(self._transformer), lr=effective_lr)
 
     def _log_metrics(self, metrics: dict[str, float]) -> None:
         """Log metrics to Weights & Biases.

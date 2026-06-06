@@ -582,8 +582,9 @@ class WandbConfig(ConfigBaseModel):
 class CSFluctuationConfig(ConfigBaseModel):
     """Configuration for CS-Fluctuation logging (LoRA overfitting-onset diagnostic).
 
-    Logging-only: measures the cosine similarity between each LoRA delta and its
-    base weight and tracks its rolling fluctuation. Does not affect training.
+    Logging-only: measures the cosine similarity (CS) between each LoRA delta and
+    its base weight (paper Eq. 2) and tracks CS-Fluctuation -- the lr-normalized
+    variance of the smoothed CS slope (paper Eq. 3-4). Does not affect training.
     """
 
     enabled: bool = Field(
@@ -594,13 +595,19 @@ class CSFluctuationConfig(ConfigBaseModel):
     interval: int = Field(
         default=100,
         gt=0,
-        description="Compute and log the metric every N optimization steps",
+        description=(
+            "Compute and log CS every N optimization steps. For a faithful CS-Fluctuation "
+            "curve (resolving the second-valley turning point) use a small value, e.g. 10."
+        ),
     )
 
     window: int = Field(
         default=20,
         ge=2,
-        description="Number of recent measurements used for the rolling fluctuation (std)",
+        description=(
+            "Moving-window size M (in measurements) for CS-Fluctuation (paper Eq. 3-4). "
+            "Fluctuation becomes available after ~3*M measurements."
+        ),
     )
 
 

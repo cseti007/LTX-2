@@ -92,18 +92,56 @@ def test_tracker_fresh_lora_returns_empty() -> None:
 
 
 def test_tracker_returns_metrics_and_fluctuation() -> None:
-    """After perturbation, metrics are present, in range, and fluctuation appears after >=2 updates."""
+    """Metrics present immediately; CS-Fluctuation appears only after ~3*window measurements."""
     model = _tiny_lora_model(noise_std=0.1)
-    tracker = CSFluctuationTracker(window=5)
+    window = 5
+    tracker = CSFluctuationTracker(window=window)
 
     first = tracker.update(model)
     assert {"cs/mean", "cs/min", "cs/max"}.issubset(first)
     assert -1.0001 <= first["cs/min"] <= first["cs/max"] <= 1.0001
-    assert "cs/fluctuation" not in first  # needs at least two measurements
+    assert "cs/fluctuation" not in first  # needs ~3*window measurements
 
-    second = tracker.update(model)
-    assert "cs/fluctuation" in second
-    assert second["cs/fluctuation"] >= 0.0
+    metrics = first
+    for _ in range(3 * window):  # accumulate enough history
+        metrics = tracker.update(model)
+    assert "cs/fluctuation" in metrics
+    # model is unchanged across updates -> constant CS -> zero slope -> ~zero fluctuation
+    assert metrics["cs/fluctuation"] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_fluctuation_linear_ramp_is_zero() -> None:
+    """A constant-slope CS (steady learning) -> constant smoothed slope -> zero fluctuation."""
+    m = 5
+    cs = [float(i) for i in range(3 * m)]  # linear ramp
+    fl, slope = CSFluctuationTracker._fluctuation(cs, m, lr=1.0)
+    assert fl == pytest.approx(0.0, abs=1e-9)
+    assert slope == pytest.approx(1.0, abs=1e-9)
+
+
+def test_fluctuation_changing_slope_is_positive() -> None:
+    """A changing CS slope (convex curve) yields non-zero fluctuation in the recent window."""
+    m = 5
+    cs = [float(i * i) for i in range(4 * m)]  # quadratic -> slope keeps increasing
+    fl, _ = CSFluctuationTracker._fluctuation(cs, m, lr=1.0)
+    assert fl is not None
+    assert fl > 0.0
+
+
+def test_fluctuation_lr_normalization() -> None:
+    """Fluctuation scales as 1/lr (paper Eq. 4 normalization)."""
+    m = 5
+    cs = [float(i * i) for i in range(4 * m)]
+    fl1, _ = CSFluctuationTracker._fluctuation(cs, m, lr=1.0)
+    fl_half, _ = CSFluctuationTracker._fluctuation(cs, m, lr=0.5)
+    assert fl_half == pytest.approx(2.0 * fl1, rel=1e-9)
+
+
+def test_fluctuation_insufficient_history_is_none() -> None:
+    """Fluctuation is None until ~3*window measurements have accumulated."""
+    m = 5
+    fl, _ = CSFluctuationTracker._fluctuation([1.0, 2.0, 3.0], m, lr=1.0)
+    assert fl is None
 
 
 def test_tracker_rejects_small_window() -> None:
@@ -123,6 +161,7 @@ def _stub_trainer(enabled: bool, interval: int, step: int, dist: DistributedType
         _transformer=model,
         _cs_tracker=CSFluctuationTracker(window=5),
         _cs_fsdp_warned=False,
+        _optimizer=SimpleNamespace(param_groups=[{"lr": 1.0}]),
     )
 
 
