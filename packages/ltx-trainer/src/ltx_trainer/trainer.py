@@ -194,10 +194,17 @@ class LtxvTrainer:
 
         with progress:
             if cfg.validation.interval and not cfg.validation.skip_initial_validation:
+                self._optimizer_eval()  # Schedule-Free: use averaged weights for validation
                 with self._offloaded_optimizer_state():
                     sampled_videos_paths = self._run_validation(progress)
+                self._optimizer_train()
 
             self._accelerator.wait_for_everyone()
+
+            # Ensure a Schedule-Free optimizer is in train mode before stepping. Checkpoints save
+            # the averaged (eval-mode) weights, so a resumed run that skips initial validation could
+            # otherwise enter the loop in eval mode and fail step() with "Not in train mode!".
+            self._optimizer_train()
 
             for step in range(remaining_steps * cfg.optimization.gradient_accumulation_steps):
                 # Get next batch, reset the dataloader if needed
@@ -235,8 +242,10 @@ class LtxvTrainer:
                         and self._global_step % cfg.validation.interval == 0
                         and is_optimization_step
                     ):
+                        self._optimizer_eval()  # Schedule-Free: use averaged weights for validation
                         with self._offloaded_optimizer_state():
                             sampled_videos_paths = self._run_validation(progress)
+                        self._optimizer_train()
 
                     # Save checkpoint if needed
                     if (
@@ -245,7 +254,9 @@ class LtxvTrainer:
                         and self._global_step % cfg.checkpoints.interval == 0
                         and is_optimization_step
                     ):
+                        self._optimizer_eval()  # Schedule-Free: save averaged weights
                         self._save_checkpoint()
+                        self._optimizer_train()
 
                     self._accelerator.wait_for_everyone()
 
@@ -278,6 +289,14 @@ class LtxvTrainer:
                             "train/global_step": self._global_step,
                         }
                         metrics.update(self._sigma_tracker.get_metrics())
+                        # For D-Adaptation optimizers (Prodigy / ProdigyPlusScheduleFree) the
+                        # configured learning_rate is only a constant scale factor; the real adapted
+                        # step size is d * lr. Logging d and the effective LR makes the adaptation
+                        # (and any runaway growth that drives overfitting) visible. Absent for AdamW.
+                        param_group = self._optimizer.param_groups[0]
+                        if "d" in param_group:
+                            metrics["train/d"] = param_group["d"]
+                            metrics["train/effective_lr"] = param_group["d"] * param_group["lr"]
                         self._log_metrics(metrics)
 
                     # Fallback logging when progress bars are disabled
@@ -687,13 +706,52 @@ class LtxvTrainer:
         opt_cfg = self._config.optimization
 
         lr = opt_cfg.learning_rate
+        extra = dict(opt_cfg.optimizer_params) if opt_cfg.optimizer_params else {}
         if opt_cfg.optimizer_type == "adamw":
-            optimizer = AdamW(self._trainable_params, lr=lr)
+            optimizer = AdamW(self._trainable_params, lr=lr, **extra)
         elif opt_cfg.optimizer_type == "adamw8bit":
             # noinspection PyUnresolvedReferences
             from bitsandbytes.optim import AdamW8bit  # noqa: PLC0415
 
-            optimizer = AdamW8bit(self._trainable_params, lr=lr)
+            optimizer = AdamW8bit(self._trainable_params, lr=lr, **extra)
+        elif opt_cfg.optimizer_type == "prodigy":
+            try:
+                from prodigyopt import Prodigy  # noqa: PLC0415
+            except ImportError as exc:
+                raise ImportError(
+                    "prodigyopt is required for optimizer_type='prodigy'. "
+                    "Install it with: pip install prodigyopt"
+                ) from exc
+            # Prodigy adapts its own step size; lr=1.0 is the standard starting point.
+            # safeguard_warmup=True is recommended when a warmup scheduler is used.
+            optimizer = Prodigy(self._trainable_params, lr=lr, **extra)
+            logger.info(
+                "Using Prodigy optimizer (D-Adaptation). "
+                "learning_rate=%.4g acts as initial scale factor (recommend 1.0). "
+                "Extra params: %s",
+                lr,
+                extra or "{}",
+            )
+        elif opt_cfg.optimizer_type == "prodigy_plus_schedulefree":
+            try:
+                from prodigyplus import ProdigyPlusScheduleFree  # noqa: PLC0415
+            except ImportError as exc:
+                raise ImportError(
+                    "prodigy-plus-schedule-free is required for optimizer_type='prodigy_plus_schedulefree'. "
+                    "Install it with: pip install prodigy-plus-schedule-free"
+                ) from exc
+            # D-Adaptation + Schedule-Free: lr=1.0 is the scale factor, the schedule is handled
+            # internally (requires scheduler_type='constant', enforced in config validation).
+            # The optimizer must be switched to eval() mode around validation/checkpointing so the
+            # averaged ("real") weights are used — see _optimizer_eval()/_optimizer_train().
+            optimizer = ProdigyPlusScheduleFree(self._trainable_params, lr=lr, **extra)
+            logger.info(
+                "Using ProdigyPlusScheduleFree optimizer (D-Adaptation + Schedule-Free). "
+                "learning_rate=%.4g acts as initial scale factor (recommend 1.0). "
+                "Extra params: %s",
+                lr,
+                extra or "{}",
+            )
         else:
             raise ValueError(f"Unknown optimizer type: {opt_cfg.optimizer_type}")
 
@@ -701,6 +759,28 @@ class LtxvTrainer:
 
         # noinspection PyTypeChecker
         self._optimizer, self._lr_scheduler = self._accelerator.prepare(optimizer, lr_scheduler)
+
+    def _optimizer_eval(self) -> None:
+        """Switch a Schedule-Free optimizer to eval mode (averaged weights).
+
+        Must be called before validation sampling and checkpoint saving so the averaged
+        ("real") weights are used. No-op for optimizers without an eval() method (AdamW,
+        Prodigy), so it is safe to call unconditionally. AcceleratedOptimizer delegates
+        attribute access to the wrapped optimizer, so eval() resolves to the underlying
+        optimizer's method.
+        """
+        eval_fn = getattr(self._optimizer, "eval", None)
+        if callable(eval_fn):
+            eval_fn()
+
+    def _optimizer_train(self) -> None:
+        """Switch a Schedule-Free optimizer back to train mode after eval/checkpointing.
+
+        No-op for optimizers without a train() method. See _optimizer_eval().
+        """
+        train_fn = getattr(self._optimizer, "train", None)
+        if callable(train_fn):
+            train_fn()
 
     def _create_scheduler(self, optimizer: torch.optim.Optimizer) -> LRScheduler | None:
         """Create learning rate scheduler based on config."""

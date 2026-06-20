@@ -231,7 +231,8 @@ optimization:
   batch_size: 1                        # Batch size per GPU
   gradient_accumulation_steps: 1       # Steps to accumulate gradients
   max_grad_norm: 1.0                   # Gradient clipping threshold
-  optimizer_type: "adamw"              # "adamw" or "adamw8bit"
+  optimizer_type: "adamw"              # "adamw", "adamw8bit", "prodigy", "prodigy_plus_schedulefree"
+  optimizer_params: { }                # Extra kwargs forwarded to the optimizer constructor
   scheduler_type: "linear"             # Scheduler type
   scheduler_params: { }                # Additional scheduler parameters
   enable_gradient_checkpointing: true  # Memory optimization
@@ -245,6 +246,8 @@ optimization:
 | `steps`                         | Total number of training steps                                                               |
 | `batch_size`                    | Batch size per GPU (reduce if running out of memory)                                         |
 | `gradient_accumulation_steps`   | Accumulate gradients over multiple steps                                                     |
+| `optimizer_type`                | Optimizer: `"adamw"`, `"adamw8bit"`, `"prodigy"`, `"prodigy_plus_schedulefree"`. The Prodigy variants use D-Adaptation (set `learning_rate: 1.0`); `prodigy_plus_schedulefree` also requires `scheduler_type: "constant"` |
+| `optimizer_params`              | Extra keyword args forwarded verbatim to the optimizer constructor (e.g. Prodigy: `{betas: [0.95, 0.99], prodigy_steps: 750}`) |
 | `scheduler_type`                | LR scheduler: `"constant"`, `"linear"`, `"cosine"`, `"cosine_with_restarts"`, `"polynomial"`, `"step"` |
 | `enable_gradient_checkpointing` | Trade training speed for GPU memory savings (recommended for large models)                   |
 

@@ -156,7 +156,8 @@ optimization:
   # Maximum gradient norm for clipping (helps training stability)
   max_grad_norm: 1.0
 
-  # Optimizer type: "adamw" (standard) or "adamw8bit" (memory-efficient)
+  # Optimizer type: "adamw" (standard), "adamw8bit" (memory-efficient),
+  # "prodigy" (auto LR), or "prodigy_plus_schedulefree" (auto LR + Schedule-Free).
   optimizer_type: "adamw"
 
   # Learning rate scheduler type
@@ -165,6 +166,21 @@ optimization:
 
   # Additional scheduler parameters (depends on scheduler_type)
   scheduler_params: { }
+
+  # --- Alternative: ProdigyPlusScheduleFree (D-Adaptation + Schedule-Free) ---
+  # Keeps Prodigy's automatic learning rate while adding Schedule-Free averaging and several
+  # anti-overfitting brakes. To use it, replace the three settings above with:
+  #
+  #   learning_rate: 1.0          # acts only as a scale factor; leave at 1.0
+  #   optimizer_type: "prodigy_plus_schedulefree"
+  #   scheduler_type: "constant"  # REQUIRED -- Schedule-Free handles decay itself (enforced)
+  #   optimizer_params:
+  #     betas: [0.95, 0.99]       # recommended for Schedule-Free
+  #     prodigy_steps: 750        # ~25% of `steps`: freezes adaptive LR growth (anti-overfit)
+  #     # use_orthograd: true     # optional 2nd-stage anti-overfitting knob; try only if needed
+  #     # weight_decay: 0.0       # leave at 0 first; tune one variable at a time
+  #
+  # Defaults left enabled by the optimizer: use_stableadamw, factored (low VRAM), split_groups (LoRA+).
 
   # Enable gradient checkpointing to reduce memory usage
   # Recommended for training with limited GPU memory
