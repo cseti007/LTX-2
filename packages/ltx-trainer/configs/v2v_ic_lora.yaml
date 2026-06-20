@@ -302,6 +302,18 @@ validation:
   # Skip validation at the beginning of training (step 0)
   skip_initial_validation: false
 
+  # --- Deterministic validation loss (optional, off by default) ---
+  # Logs a held-out val loss alongside the visual samples, computed at a fixed sigma
+  # grid with seeded noise so it reflects model quality, not sampling variance. Useful
+  # for overfitting detection. Correlates only weakly with sample quality -- use as a
+  # complement to visual val, not a replacement. To enable, uncomment:
+  #
+  #   compute_val_loss: true
+  #   val_data_root: "/path/to/held_out/.precomputed"  # same layout as data.preprocessed_data_root
+  #   val_loss_timesteps: [0.05, 0.15, 0.25, 0.35, 0.45, 0.55, 0.65, 0.75, 0.85, 0.95]
+  #   val_loss_seed: 12345
+  #   val_loss_max_samples: null   # cap per run to keep it fast; null = use all
+
 # -----------------------------------------------------------------------------
 # Checkpoint Configuration
 # -----------------------------------------------------------------------------

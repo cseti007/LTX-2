@@ -593,6 +593,68 @@ class ValidationConfig(ConfigBaseModel):
         "with the generated output. The reference comes from the input video, not from the model's output.",
     )
 
+    compute_val_loss: bool = Field(
+        default=False,
+        description=(
+            "If True, compute and log a deterministic validation loss alongside the visual val samples. "
+            "Requires `val_data_root` to point to a held-out preprocessed dataset. The loss is computed "
+            "with fixed timesteps and seeded noise, so changes between runs reflect model quality, not "
+            "sampling variance. Useful for overfitting detection and comparing runs. Note: diffusion val "
+            "loss correlates only weakly with sample quality — use it as a complement to visual val, "
+            "not a replacement."
+        ),
+    )
+
+    val_data_root: str | None = Field(
+        default=None,
+        description=(
+            "Path to a held-out preprocessed dataset for val loss computation. Must follow the same "
+            "layout as `data.preprocessed_data_root` (.precomputed/{latents,conditions,...}/). "
+            "Required when `compute_val_loss=True`."
+        ),
+    )
+
+    val_loss_timesteps: list[float] = Field(
+        default_factory=lambda: [0.05, 0.15, 0.25, 0.35, 0.45, 0.55, 0.65, 0.75, 0.85, 0.95],
+        description=(
+            "Fixed sigma grid used when computing val loss. Eliminates timestep-sampling variance so "
+            "the loss is comparable across runs. Each value must be in [0, 1]. Per-timestep losses are "
+            "logged separately in addition to the overall mean."
+        ),
+    )
+
+    val_loss_seed: int = Field(
+        default=12345,
+        description=(
+            "Seed for the noise used in val loss computation. The same seed produces the same noise "
+            "across runs, so val loss differences reflect model changes, not noise variance."
+        ),
+    )
+
+    val_loss_max_samples: int | None = Field(
+        default=None,
+        description=(
+            "Cap on the number of val videos used per val loss run. None means use all. "
+            "Useful for keeping val loss runs fast during long trainings."
+        ),
+    )
+
+    @field_validator("val_loss_timesteps")
+    @classmethod
+    def validate_val_loss_timesteps(cls, v: list[float]) -> list[float]:
+        if not v:
+            raise ValueError("val_loss_timesteps must be non-empty")
+        for t in v:
+            if not 0.0 <= t <= 1.0:
+                raise ValueError(f"val_loss_timesteps values must be in [0, 1], got {t}")
+        return v
+
+    @model_validator(mode="after")
+    def validate_val_loss_requires_data_root(self) -> "ValidationConfig":
+        if self.compute_val_loss and not self.val_data_root:
+            raise ValueError("compute_val_loss=True requires val_data_root to be set")
+        return self
+
     @field_validator("images")
     @classmethod
     def validate_images(cls, v: list[str] | None, info: ValidationInfo) -> list[str] | None:

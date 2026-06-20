@@ -331,6 +331,11 @@ validation:
 | `generate_audio`         | Whether to generate audio in validation samples                                                                          |
 | `generate_video`         | Whether to generate video in validation samples. Set to `false` for V2A (video-to-audio) validation. Default: `true`     |
 | `skip_initial_validation`| Skip validation video sampling at step 0 (beginning of training)                                                         |
+| `compute_val_loss`       | Log a deterministic held-out val loss (fixed sigma grid + seeded noise) alongside the visual samples. Off by default; requires `val_data_root`. For overfitting detection — correlates only weakly with sample quality |
+| `val_data_root`          | Held-out preprocessed dataset for val loss (same `.precomputed/` layout as `data.preprocessed_data_root`). Required when `compute_val_loss=true` |
+| `val_loss_timesteps`     | Fixed sigma grid for val loss; each value in `[0, 1]`. Per-timestep losses (`val/loss_t05`..`val/loss_t95`) plus low/high-sigma buckets are logged alongside the overall `val/loss` |
+| `val_loss_seed`          | Seed for the val-loss noise; same seed → same noise across runs                                                          |
+| `val_loss_max_samples`   | Cap on val videos per val-loss run (`null` = use all); keeps val loss fast during long trainings                          |
 
 #### ValidationSample
 

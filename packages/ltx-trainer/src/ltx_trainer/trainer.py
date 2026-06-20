@@ -46,6 +46,7 @@ from ltx_trainer.sigma_tracker import SigmaBucketTracker
 from ltx_trainer.timestep_samplers import SAMPLERS
 from ltx_trainer.training_state import ConfigFingerprint, RngStates, TrainingState
 from ltx_trainer.training_strategies import get_training_strategy
+from ltx_trainer.validation_loss import ValidationLossEvaluator
 from ltx_trainer.validation_runner import ValidationRunner
 
 # Disable irrelevant warnings from transformers
@@ -117,6 +118,7 @@ class LtxvTrainer:
         self._sigma_tracker = SigmaBucketTracker()
         self._cs_tracker = CSFluctuationTracker(window=self._config.cs_fluctuation.window)
         self._cs_fsdp_warned = False
+        self._val_loss_evaluator: ValidationLossEvaluator | None = None
         self._wandb_run = None
 
     def train(  # noqa: PLR0912, PLR0915
@@ -200,6 +202,7 @@ class LtxvTrainer:
                 self._optimizer_eval()  # Schedule-Free: use averaged weights for validation
                 with self._offloaded_optimizer_state():
                     sampled_videos_paths = self._run_validation(progress)
+                    self._run_val_loss()
                 self._optimizer_train()
 
             self._accelerator.wait_for_everyone()
@@ -248,6 +251,7 @@ class LtxvTrainer:
                         self._optimizer_eval()  # Schedule-Free: use averaged weights for validation
                         with self._offloaded_optimizer_state():
                             sampled_videos_paths = self._run_validation(progress)
+                            self._run_val_loss()
                         self._optimizer_train()
 
                     # Save checkpoint if needed
@@ -370,9 +374,11 @@ class LtxvTrainer:
 
         return saved_path, stats
 
-    def _training_step(self, batch: dict[str, dict[str, Tensor]]) -> TrainingStepOutput:
-        """Perform a single training step using the configured strategy."""
-        # Apply embedding connectors to transform pre-computed text embeddings
+    def _apply_embedding_connectors(self, batch: dict[str, dict[str, Tensor]]) -> None:
+        """Apply the text-embedding connectors in place, converting precomputed features to
+        context embeds. Mutates batch["conditions"]; apply exactly once per batch (it overwrites
+        the feature tensors it reads). Shared by training and val-loss forward passes.
+        """
         conditions = batch["conditions"]
 
         if "video_prompt_embeds" in conditions:
@@ -393,6 +399,11 @@ class LtxvTrainer:
         conditions["video_prompt_embeds"] = video_embeds
         conditions["audio_prompt_embeds"] = audio_embeds
         conditions["prompt_attention_mask"] = attention_mask
+
+    def _training_step(self, batch: dict[str, dict[str, Tensor]]) -> TrainingStepOutput:
+        """Perform a single training step using the configured strategy."""
+        # Apply embedding connectors to transform pre-computed text embeddings
+        self._apply_embedding_connectors(batch)
 
         # Use strategy to prepare training inputs (returns ModelInputs with Modality objects)
         model_inputs = self._training_strategy.prepare_training_inputs(batch, self._timestep_sampler)
@@ -921,6 +932,26 @@ class LtxvTrainer:
             for state, k in offloaded:
                 state[k] = state[k].to(device)
 
+    def _run_val_loss(self) -> None:
+        """Compute the deterministic validation loss and log it, if enabled.
+
+        Lazily builds the evaluator on first use (strategy/transformer are ready by then).
+        Metrics are logged through the trainer so all W&B logging shares one explicit step axis.
+        """
+        if not self._config.validation.compute_val_loss:
+            return
+        if self._val_loss_evaluator is None:
+            self._val_loss_evaluator = ValidationLossEvaluator(
+                config=self._config,
+                strategy=self._training_strategy,
+                transformer=self._transformer,
+                accelerator=self._accelerator,
+                apply_connectors=self._apply_embedding_connectors,
+            )
+        metrics = self._val_loss_evaluator.run(self._global_step)
+        if metrics:
+            self._log_metrics(metrics)
+
     def _run_validation(self, progress: TrainingProgress) -> list[Path]:
         """Run distributed validation by delegating to the ValidationRunner.
         Each rank generates its assigned subset of validation samples (round-robin by
@@ -1218,4 +1249,7 @@ class LtxvTrainer:
     def _log_metrics(self, metrics: dict[str, float]) -> None:
         """Log metrics to Weights & Biases."""
         if self._wandb_run is not None:
-            self._wandb_run.log(metrics)
+            # Pin to the training step. Without an explicit step, multiple log() calls per step
+            # (e.g. per-step metrics plus a separate val-loss log) advance W&B's internal step
+            # counter, desyncing later logs (validation videos) from global_step.
+            self._wandb_run.log(metrics, step=self._global_step)
