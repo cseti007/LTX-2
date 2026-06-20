@@ -35,6 +35,7 @@ from ltx_core.text_encoders.gemma import convert_to_additive_mask
 from ltx_trainer import logger
 from ltx_trainer.config import LtxTrainerConfig
 from ltx_trainer.config_display import print_config
+from ltx_trainer.cs_fluctuation_tracker import CSFluctuationTracker
 from ltx_trainer.datasets import PrecomputedDataset
 from ltx_trainer.gpu_utils import free_gpu_memory, get_gpu_memory_gb
 from ltx_trainer.hf_hub_utils import push_to_hub
@@ -114,6 +115,8 @@ class LtxvTrainer:
         self._training_state_paths: list[Path] = []
         self._training_state_size_warned = False
         self._sigma_tracker = SigmaBucketTracker()
+        self._cs_tracker = CSFluctuationTracker(window=self._config.cs_fluctuation.window)
+        self._cs_fsdp_warned = False
         self._wandb_run = None
 
     def train(  # noqa: PLR0912, PLR0915
@@ -289,6 +292,7 @@ class LtxvTrainer:
                             "train/global_step": self._global_step,
                         }
                         metrics.update(self._sigma_tracker.get_metrics())
+                        metrics.update(self._compute_cs_fluctuation())
                         # For D-Adaptation optimizers (Prodigy / ProdigyPlusScheduleFree) the
                         # configured learning_rate is only a constant scale factor; the real adapted
                         # step size is d * lr. Logging d and the effective LR makes the adaptation
@@ -1190,6 +1194,26 @@ class LtxvTrainer:
             init_kwargs["resume"] = "must"
         run = wandb.init(**init_kwargs)
         self._wandb_run = run
+
+    def _compute_cs_fluctuation(self) -> dict[str, float]:
+        """Compute the CS-Fluctuation diagnostic for the current step, if enabled.
+
+        Returns an empty dict when disabled, off-interval, or not applicable
+        (no LoRA layers, or FSDP where weights are sharded).
+        """
+        cfg = self._config.cs_fluctuation
+        if not cfg.enabled or self._global_step % cfg.interval != 0:
+            return {}
+        if self._accelerator.distributed_type == DistributedType.FSDP:
+            if not self._cs_fsdp_warned:
+                logger.warning("CS-Fluctuation logging is not supported under FSDP (sharded weights); skipping.")
+                self._cs_fsdp_warned = True
+            return {}
+        # Effective step size for the Eq. 4 lr-normalization: prodigy adapts via "d", so the
+        # effective lr is d*lr; standard optimizers use lr directly.
+        pg = self._optimizer.param_groups[0]
+        effective_lr = pg["d"] * pg["lr"] if "d" in pg else pg["lr"]
+        return self._cs_tracker.update(self._accelerator.unwrap_model(self._transformer), lr=effective_lr)
 
     def _log_metrics(self, metrics: dict[str, float]) -> None:
         """Log metrics to Weights & Biases."""

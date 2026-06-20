@@ -444,6 +444,21 @@ flow_matching:
 | `timestep_sampling_mode`   | Sampling strategy: `"uniform"` or `"shifted_logit_normal"` |
 | `timestep_sampling_params` | Additional parameters for the sampling strategy            |
 
+### CSFluctuationConfig
+
+CS-Fluctuation logging: a diagnostic for detecting the onset of LoRA overfitting. For each LoRA layer it measures the
+cosine similarity between the adapter's weight delta (`scaling * B @ A`) and its frozen base weight, averages across
+layers, and tracks how much that average fluctuates over a rolling window. When the fluctuation flattens out, it signals
+the onset of overfitting. This is logging-only (read under `no_grad`) and does not affect the loss, gradients, or the
+optimizer. Applies to LoRA training only; not supported under FSDP (sharded weights).
+
+```yaml
+cs_fluctuation:
+  enabled: false  # Enable CS-Fluctuation logging (LoRA mode only)
+  interval: 100   # Compute and log every N optimization steps
+  window: 20      # Recent measurements used for the rolling fluctuation (std)
+```
+
 ### General Configuration
 
 Top-level settings for the training run.
