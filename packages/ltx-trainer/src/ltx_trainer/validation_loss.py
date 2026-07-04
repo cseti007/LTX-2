@@ -94,10 +94,12 @@ class ValidationLossEvaluator:
 
     @staticmethod
     def _batch_size(batch: dict[str, dict[str, Tensor]]) -> int:
-        for key in ("video_latents", "audio_latents"):
-            if key in batch:
-                return batch[key]["latents"].shape[0]
-        raise KeyError("batch has neither 'video_latents' nor 'audio_latents'")
+        # Key names differ per strategy (e.g. "video_latents" for flexible,
+        # "latents" for video_to_video); any latent source carries the batch dim.
+        for value in batch.values():
+            if isinstance(value, dict) and isinstance(value.get("latents"), Tensor):
+                return value["latents"].shape[0]
+        raise KeyError("no latent source found in batch")
 
     @torch.inference_mode()
     def run(self, global_step: int) -> dict[str, float] | None:
