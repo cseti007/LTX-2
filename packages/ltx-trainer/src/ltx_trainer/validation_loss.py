@@ -76,7 +76,7 @@ class ValidationLossEvaluator:
         if self._dataloader is not None:
             return
         val_cfg = self._config.validation
-        data_sources = self._strategy.get_data_sources()
+        data_sources = self._strategy.config.get_data_sources()
         dataset = PrecomputedDataset(val_cfg.val_data_root, data_sources=data_sources)
         logger.info(f"Loaded val dataset with {len(dataset):,} samples from {val_cfg.val_data_root}")
 
