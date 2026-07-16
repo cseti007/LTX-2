@@ -8,6 +8,7 @@ The foundational library for the LTX-2 Audio-Video generation model. This packag
 - **`conditioning/`**: Tools for preparing latent states and applying conditioning (image, video, keyframes)
 - **`guidance/`**: Perturbation system for fine-grained control over attention mechanisms
 - **`loader/`**: Utilities for loading weights from `.safetensors`, fusing LoRAs, and managing memory
+- **`block_streaming/`**: Memory-efficient inference that streams transformer blocks through the GPU one at a time (from pinned CPU buffers or directly from disk)
 - **`model/`**: PyTorch implementations of the LTX-2 Transformer, Video VAE, Audio VAE, Vocoder and Upscaler
 - **`text_encoders/gemma`**: Gemma text encoder implementation with tokenizers, feature extractors, and separate encoders for audio-video and video-only generation
 - **`quantization/`**: FP8 quantization backends (FP8-TensorRT-LLM scaled MM, FP8 cast) for reduced memory footprint.
@@ -55,6 +56,7 @@ pip install -e packages/ltx-core
 
 - **Loader** ([`loader/`](src/ltx_core/loader/)): Model loading from `.safetensors`, LoRA fusion, weight remapping, and memory management
 - **Quantization** ([`quantization/`](src/ltx_core/quantization/)): FP8 quantization backends for reduced memory footprint and faster inference
+- **Block Streaming** ([`block_streaming/`](src/ltx_core/block_streaming/)): Streams transformer blocks through the GPU one block at a time, so the full model runs on machines without enough memory to hold all its weights at once
 
 ### Loader
 
@@ -77,13 +79,17 @@ model = builder.build(device=torch.device("cuda"))
 Use the `.lora()` method to attach one or more LoRA adapters before calling `.build()`:
 
 ```python
+from ltx_core.loader import SDOps
+
+lora_sd_ops = SDOps(name="identity").with_matching()  # or a model-specific key-renaming SDOps
+
 builder = (
     SingleGPUModelBuilder(
         model_class_configurator=MyModelConfigurator,
         model_path="/path/to/model.safetensors",
     )
-    .lora("/path/to/lora_a.safetensors", strength=0.8)
-    .lora("/path/to/lora_b.safetensors", strength=0.5)
+    .lora("/path/to/lora_a.safetensors", 0.8, lora_sd_ops)
+    .lora("/path/to/lora_b.safetensors", 0.5, lora_sd_ops)
 )
 model = builder.build(device=torch.device("cuda"))
 ```
@@ -103,7 +109,7 @@ builder = SingleGPUModelBuilder(
     model_class_configurator=MyModelConfigurator,
     model_path="/path/to/model.safetensors",
     lora_load_device=torch.device("cuda"),
-).lora("/path/to/lora.safetensors", strength=1.0)
+).lora("/path/to/lora.safetensors", 1.0, lora_sd_ops)
 
 model = builder.build(device=torch.device("cuda"))
 ```
@@ -121,39 +127,26 @@ Uses NVIDIA TensorRT-LLM's `cublas_scaled_mm` for efficient FP8 matrix multiplic
 **Usage with QuantizationPolicy:**
 
 ```python
-from ltx_core.quantization import QuantizationPolicy
+from ltx_core.quantization.fp8_scaled_mm import build_policy as build_fp8_scaled_mm_policy
 
-# Dynamic input quantization (no calibration needed)
-policy = QuantizationPolicy.fp8_scaled_mm()
-
-# Static input quantization with calibration file
-policy = QuantizationPolicy.fp8_scaled_mm(calibration_amax_path="/path/to/amax.json")
+# Discovers the layer set from the checkpoint's .weight_scale tensors
+policy = build_fp8_scaled_mm_policy("/path/to/checkpoint.safetensors")
 ```
 
-The policy provides `sd_ops` and `module_ops` that can be passed to the model builder:
+The policy carries `sd_ops`, `module_ops`, and `fuse_rule` that are passed to the model builder:
 
 ```python
+import torch
 from ltx_core.loader import SingleGPUModelBuilder
 
 builder = SingleGPUModelBuilder(
-    model=model,
-    device=device,
-    sd_ops=policy.sd_ops,
+    model_class_configurator=MyModelConfigurator,
+    model_path="/path/to/checkpoint.safetensors",
+    model_sd_ops=policy.sd_ops,
     module_ops=policy.module_ops,
+    fuse_rule=policy.fuse_rule,
 )
-builder.load(checkpoint_path)
-```
-
-**Calibration File Format** (for static input quantization):
-
-```json
-{
-  "amax_values": {
-    "transformer_blocks.0.attn.to_q.input_quantizer": 12.5,
-    "transformer_blocks.0.attn.to_k.input_quantizer": 8.3,
-    ...
-  }
-}
+model = builder.build(device=torch.device("cuda"))
 ```
 
 #### FP8 Cast
@@ -161,7 +154,42 @@ builder.load(checkpoint_path)
 A simpler approach that casts weights to FP8 for storage and upcasts during inference:
 
 ```python
-policy = QuantizationPolicy.fp8_cast()
+from ltx_core.quantization.fp8_cast import build_policy as build_fp8_cast_policy
+
+policy = build_fp8_cast_policy("/path/to/checkpoint.safetensors")
+```
+
+### Block Streaming
+
+The `block_streaming/` module ([`src/ltx_core/block_streaming/`](src/ltx_core/block_streaming/)) lets the full model run on machines that lack the memory to hold all of its weights at once. It streams the transformer's blocks through a small rolling set of GPU buffers, loading each block's weights just before it runs and recycling them afterwards, so only a few blocks are resident on the GPU at any moment. Construct it with `StreamingModelBuilder`, which returns a `BlockStreamingWrapper` -- an `nn.Module` drop-in for the wrapped model.
+
+#### Strategies
+
+The strategy is chosen automatically from `cpu_slots_count` relative to the number of blocks:
+
+- **RAM streaming** (default, `cpu_slots_count` omitted or `>= num_blocks`): all blocks are pre-loaded into pinned CPU buffers (with LoRA fusion) at build time, then copied to the GPU on demand. Fast; higher CPU memory.
+- **Disk streaming** (`cpu_slots_count < num_blocks`): blocks are read from the `.safetensors` file on demand on a background worker thread. Slower; lowest CPU memory.
+
+#### Basic usage
+
+```python
+import torch
+from ltx_core.block_streaming import StreamingModelBuilder
+
+builder = StreamingModelBuilder(
+    model_class_configurator=MyModelConfigurator,
+    model_path="/path/to/model.safetensors",
+    blocks_attr="transformer_blocks",      # dotted path to the nn.ModuleList
+    blocks_prefix="transformer_blocks",    # state-dict key prefix for block weights
+)
+
+# Omit cpu_slots_count for RAM streaming; pass a value < num_blocks for disk streaming.
+model = builder.build(
+    device=torch.device("cuda"),
+    dtype=torch.bfloat16,
+    cpu_slots_count=4,
+    gpu_slots_count=2,
+)
 ```
 
 For complete, production-ready pipeline implementations that combine these building blocks, see the [`ltx-pipelines`](../ltx-pipelines/) package.

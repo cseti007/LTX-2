@@ -1,6 +1,6 @@
 [project]
 name = "ltx-trainer"
-version = "1.1.2"
+version = "1.1.6"
 description = "LTX-2 training, democratized."
 readme = "README.md"
 authors = [
@@ -12,25 +12,33 @@ dependencies = [
     "accelerate>=1.2.1",
     "av>=14.2.1",
     "bitsandbytes >=0.45.2; sys_platform == 'linux'",
+    "google-genai>=2.0",
     "huggingface-hub[hf-xet]>=0.31.4",
     "imageio>=2.37.0",
     "imageio-ffmpeg>=0.6.0",
+    "openai>=2.0",
     "opencv-python>=4.11.0.86",
     "optimum-quanto>=0.2.6",
     "pandas>=2.2.3",
     "peft>=0.14.0",
     "pillow-heif>=0.21.0",
+    "prodigyopt>=1.1.2",
+    "prodigy-plus-schedule-free>=2.0.1",
     "pydantic>=2.10.4",
     "rich>=13.9.4",
     "safetensors>=0.5.0",
     "scenedetect>=0.6.5.2",
     "sentencepiece>=0.2.0",
+    "soundfile>=0.12.1",
     "torch>=2.6.0",
     "torchaudio>=2.7.0",
-    "torchcodec>=0.8.1",
+    # torchcodec must match the torch version (it ships a torch-ABI C++ extension and declares
+    # no torch pin of its own); the 0.9 line matches torch 2.9. torchaudio>=2.9 routes
+    # torchaudio.load() through torchcodec, so audio preprocessing needs it installed.
+    "torchcodec>=0.8.1,<0.10",
     "torchvision>=0.21.0",
     "typer>=0.15.1",
-    "wandb>=0.19.11",
+    "wandb>=0.27.0",
     "setuptools>=79.0.0",
 ]
 
@@ -48,8 +56,11 @@ build-backend = "hatchling.build"
 
 
 [tool.ruff]
-target-version = "1.1.2"
+target-version = "py310"
 line-length = 120
+# Restrict isort first-party detection to src/ so stray dirs (e.g. wandb/ run output)
+# next to pyproject.toml don't get classified as first-party packages. See ruff#10519.
+src = ["src"]
 
 [tool.ruff.lint]
 select = [
